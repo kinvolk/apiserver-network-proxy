@@ -15,6 +15,7 @@ spec:
       requests:
         cpu: 1m
     command: [ "/proxy-server"]
+    #command: [ "sleep", "5000" ]
     args: [
       "--log-file=/var/log/konnectivity-server.log",
       "--logtostderr=false",
@@ -25,7 +26,7 @@ spec:
       "--server-port=0",
       "--agent-port=8091",
       "--health-port=8092",
-      "--admin-port=8093",
+      "--admin-port=8013",
       "--keepalive-time=1h",
       "--mode=http-connect",
       "--agent-namespace=kube-system",
@@ -52,8 +53,8 @@ spec:
       containerPort: 8092
       hostPort: 8092
     - name: adminport
-      containerPort: 8093
-      hostPort: 8093
+      containerPort: 8013
+      hostPort: 8013
     volumeMounts:
     - name: varlogkonnectivityserver
       mountPath: /var/log/konnectivity-server.log

@@ -24,7 +24,7 @@ spec:
     args: [
       "--logtostderr=true",
       "--ca-cert=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
-      "--proxy-server-host=${CLUSTER_IP}",
+      "--proxy-server-host=127.0.0.1",
       "--proxy-server-port=8091",
       "--service-account-token-path=/var/run/secrets/tokens/konnectivity-agent-token",
       ]

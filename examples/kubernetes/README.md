@@ -12,7 +12,7 @@ kubectl apply -f examples/kubernetes/kubia.yaml
 ```
 
 # Initialize environment variables
-*CLUSTER_CERT* and *CLUSTER_KEY* are certificates used for starting [kubernetes API server](https://kubernetes.io/docs/concepts/cluster-administration/certificates/)
+*CLUSTER_CERT* and *CLUSTER_KEY* are certificates used for starting [kubernetes API server](https://kubernetes.io/docs/concepts/cluster-administration/certificates/). See [the parameters](https://kubernetes.io/docs/reference/command-line-tools-reference/kube-apiserver/)  `--cert-dir` or `--tls-cert-file` and `--tls-private-key-file` on the API server.
 
 ```bash
 CLUSTER_IP=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' | sed -n "s/https\:\/\/\(\S*\).*$/\1/p")
@@ -30,6 +30,18 @@ CLUSTER_KEY=</yourdirectory/server.key>
 CLUSTER_CERT=/etc/srv/kubernetes/pki/apiserver.crt
 CLUSTER_KEY=/etc/srv/kubernetes/pki/apiserver.key
 ```
+
+#### Kubernetes git sample configuration
+When you start kubernetes from git using the hack/local-up-cluster.sh script,
+the default values are:
+
+# TODO: this does not really work, as the pods use hostPath and create the
+# directories, we ended up copying them. FIX!
+```bash
+CLUSTER_CERT=/var/run/kubernetes/serving-kube-apiserver.crt
+CLUSTER_KEY=/var/run/kubernetes/serving-kube-apiserver.key
+```
+
 
 # Register SERVER_TOKEN in [static-token-file](https://kubernetes.io/docs/reference/access-authn-authz/authentication/#static-token-file)
 Append the output of the following line to the [static-token-file](https://kubernetes.io/docs/reference/access-authn-authz/authentication/#static-token-file) and restart **kube-apiserver** on the control plane.
@@ -78,7 +90,7 @@ TAG=${TAG} AGENT_IMAGE=${AGENT_IMAGE} CLUSTER_IP=${CLUSTER_IP}  envsubst < examp
 
 # Run **test-client** as a [static pod](https://kubernetes.io/docs/tasks/configure-pod-container/static-pod/) with following configuration on same machine where **proxy-server** runs
 ```bash
-TAG=${TAG} KUBIA_IP=${KUBIA_IP} TEST_CLIENT_IMAGE=${TEST_CLIENT_IMAGE} envsubst < examples/kubernetes/konnectivity-test-client.yaml
+TAG=${TAG} KUBIA_IP=${KUBIA_IP} TEST_CLIENT_IMAGE=${TEST_CLIENT_IMAGE} envsubst < examples/kubernetes/konnectivity-test-client.yaml | kubectl apply -f -
 ```
 
 Last row in the following log file **/var/log/konnectivity-test-client.log** supposed to be: **You've hit kubia**
