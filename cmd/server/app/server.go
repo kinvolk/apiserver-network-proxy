@@ -252,7 +252,7 @@ func (p *Proxy) runMTLSFrontendServer(ctx context.Context, o *options.ProxyRunOp
 	if o.Mode == "grpc" {
 		frontendServerOptions := []grpc.ServerOption{
 			grpc.Creds(credentials.NewTLS(tlsConfig)),
-			grpc.KeepaliveParams(keepalive.ServerParameters{Time: o.FrontendKeepaliveTime, MaxConnectionIdle: 1 * time.Minute}),
+			grpc.KeepaliveParams(keepalive.ServerParameters{Time: o.FrontendKeepaliveTime, MaxConnectionIdle: 1 * time.Minute, MaxConnectionAge: 1 * time.Minute, MaxConnectionAgeGrace: 10 * time.Second}),
 		}
 		grpcServer := grpc.NewServer(frontendServerOptions...)
 		client.RegisterProxyServiceServer(grpcServer, s)
