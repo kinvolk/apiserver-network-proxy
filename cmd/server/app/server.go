@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
@@ -251,7 +252,7 @@ func (p *Proxy) runMTLSFrontendServer(ctx context.Context, o *options.ProxyRunOp
 	if o.Mode == "grpc" {
 		frontendServerOptions := []grpc.ServerOption{
 			grpc.Creds(credentials.NewTLS(tlsConfig)),
-			grpc.KeepaliveParams(keepalive.ServerParameters{Time: o.FrontendKeepaliveTime}),
+			grpc.KeepaliveParams(keepalive.ServerParameters{Time: o.FrontendKeepaliveTime, MaxConnectionIdle: 1 * time.Minute}),
 		}
 		grpcServer := grpc.NewServer(frontendServerOptions...)
 		client.RegisterProxyServiceServer(grpcServer, s)
