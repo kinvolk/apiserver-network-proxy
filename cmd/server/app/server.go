@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
@@ -171,7 +172,7 @@ func (p *Proxy) runUDSFrontendServer(ctx context.Context, o *options.ProxyRunOpt
 	var stop StopFunc
 	if o.Mode == "grpc" {
 		frontendServerOptions := []grpc.ServerOption{
-			grpc.KeepaliveParams(keepalive.ServerParameters{Time: o.FrontendKeepaliveTime}),
+			grpc.KeepaliveParams(keepalive.ServerParameters{Time: o.FrontendKeepaliveTime, MaxConnectionIdle: 2 * time.Minute}),
 		}
 		grpcServer := grpc.NewServer(frontendServerOptions...)
 		client.RegisterProxyServiceServer(grpcServer, s)
