@@ -268,6 +268,18 @@ func (a *Client) Send(pkt *client.Packet) error {
 	return err
 }
 
+func (a *Client) CloseSend(pkt *client.Packet) error {
+	a.sendLock.Lock()
+	defer a.sendLock.Unlock()
+
+	err := a.stream.CloseSend(pkt)
+	if err != nil && err != io.EOF {
+		metrics.Metrics.ObserveFailure(metrics.DirectionToServer)
+		a.cs.RemoveClient(a.serverID)
+	}
+	return err
+}
+
 func (a *Client) Recv() (*client.Packet, error) {
 	a.recvLock.Lock()
 	defer a.recvLock.Unlock()
@@ -409,7 +421,7 @@ func (a *Client) Serve() {
 						resp.GetCloseResponse().Error = err.Error()
 					}
 
-					if err := a.Send(resp); err != nil {
+					if err := a.CloseSend(resp); err != nil {
 						klog.ErrorS(err, "close response failure")
 					}
 
