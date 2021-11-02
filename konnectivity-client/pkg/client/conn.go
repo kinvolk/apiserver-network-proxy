@@ -18,6 +18,7 @@ package client
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"time"
@@ -139,6 +140,12 @@ func (c *conn) Close() error {
 	klog.V(5).InfoS("[tracing] send req", "type", req.Type)
 
 	if err := c.stream.Send(req); err != nil {
+		return err
+	}
+
+	fmt.Println("Sending CloseSend")
+	if err := c.stream.CloseSend(); err != nil {
+		fmt.Println("XXX - Printing error in CloseSend -- ", err)
 		return err
 	}
 
