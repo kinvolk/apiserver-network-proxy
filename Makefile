@@ -24,7 +24,8 @@ INSTALL_LOCATION:=$(shell go env GOPATH)/bin
 GOLANGCI_LINT_VERSION ?= 1.35.2
 GOSEC_VERSION ?= 2.5.0
 
-REGISTRY ?= gcr.io/$(shell gcloud config get-value project)
+#REGISTRY ?= gcr.io/$(shell gcloud config get-value project)
+REGISTRY ?= quay.io/imran
 STAGING_REGISTRY := gcr.io/k8s-staging-kas-network-proxy
 
 SERVER_IMAGE_NAME ?= proxy-server
