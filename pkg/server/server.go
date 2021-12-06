@@ -145,6 +145,9 @@ type ProxyServer struct {
 	AgentAuthenticationOptions *AgentTokenAuthenticationOptions
 
 	proxyStrategies []ProxyStrategy
+
+	// Kills inactive (no app payload) Proxy connections after this duration
+	grpcMaxIdleTime time.Duration
 }
 
 // AgentTokenAuthenticationOptions contains list of parameters required for agent token based authentication
@@ -326,7 +329,7 @@ func (s *ProxyServer) getFrontendsForBackendConn(agentID string, backend Backend
 }
 
 // NewProxyServer creates a new ProxyServer instance
-func NewProxyServer(serverID string, proxyStrategies []ProxyStrategy, serverCount int, agentAuthenticationOptions *AgentTokenAuthenticationOptions, warnOnChannelLimit bool) *ProxyServer {
+func NewProxyServer(serverID string, proxyStrategies []ProxyStrategy, serverCount int, agentAuthenticationOptions *AgentTokenAuthenticationOptions, warnOnChannelLimit bool, grpcMaxIdleTime time.Duration) *ProxyServer {
 	var bms []BackendManager
 	for _, ps := range proxyStrategies {
 		switch ps {
@@ -352,6 +355,7 @@ func NewProxyServer(serverID string, proxyStrategies []ProxyStrategy, serverCoun
 		Readiness:          bms[0],
 		proxyStrategies:    proxyStrategies,
 		warnOnChannelLimit: warnOnChannelLimit,
+		grpcMaxIdleTime:    grpcMaxIdleTime,
 	}
 }
 
@@ -368,6 +372,7 @@ func (s *ProxyServer) Proxy(stream client.ProxyService_ProxyServer) error {
 	klog.V(2).InfoS("proxy request from client", "userAgent", userAgent)
 
 	recvCh := make(chan *client.Packet, xfrChannelSize)
+	recvActCh := make(chan struct{}, xfrChannelSize)
 	stopCh := make(chan error)
 
 	go s.serveRecvFrontend(stream, recvCh)
@@ -396,11 +401,56 @@ func (s *ProxyServer) Proxy(stream client.ProxyService_ProxyServer) error {
 			if s.warnOnChannelLimit && len(recvCh) >= xfrChannelSize {
 				klog.V(2).InfoS("Receive channel on Proxy is full", "userAgent", userAgent, "serverID", s.serverID)
 			}
+
 			recvCh <- in
+			recvActCh <- struct{}{}
 		}
 	}()
 
-	return <-stopCh
+	// Wait to see if there is inactivity (no app layer payload received)
+	// and, if the proper flag was used, we will make this fuction finish.
+	// This finishes the grpc connection and frees up the resources used.
+	//
+	// This is a work-around to help with issue #276 but also useful to
+	// mitigate any future leaks. Sometimes the fix is in the
+	// konnectivity-client and hard to backport, so having a knob here is
+	// super useful for some cloud providers to stop the bleeding until the
+	// leak is fixed/backported.
+	// We wait here instead of in the stream.Recv() because of limitations
+	// on gRPC to do that. This is actually the recommended way to do it.
+	// For more info, see:
+	// https://github.com/grpc/grpc-go/issues/445
+	// https://github.com/grpc/grpc-go/issues/445#issuecomment-354875629
+	// https://github.com/grpc/grpc-go/issues/1229#issuecomment-300938770
+	var ret error
+
+	// If this param is specified, we set a timer. Otherwise, the timer
+	// channel will never receive anything, therefore never fire and act as
+	// there is no inactivity timeout for this connection.
+	t := &time.Timer{}
+	if s.grpcMaxIdleTime != 0 {
+		t = time.NewTimer(s.grpcMaxIdleTime)
+	}
+
+loop:
+	for {
+		select {
+		case ret = <-stopCh:
+			break loop
+		case <-recvActCh:
+			// Some packet was received, reset idle timer.
+			klog.V(5).InfoS("Data received on connection, restarting activity timer", "userAgent", userAgent, "serverID", s.serverID)
+			if s.grpcMaxIdleTime != 0 {
+				t.Stop()
+				t.Reset(s.grpcMaxIdleTime)
+			}
+		case <-t.C:
+			klog.V(2).InfoS("Stopping connection due to inactivity", "userAgent", userAgent, "serverID", s.serverID)
+			return nil
+		}
+	}
+
+	return ret
 }
 
 func (s *ProxyServer) serveRecvFrontend(stream client.ProxyService_ProxyServer, recvCh <-chan *client.Packet) {
