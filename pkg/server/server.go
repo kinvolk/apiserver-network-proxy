@@ -372,10 +372,10 @@ func (s *ProxyServer) Proxy(stream client.ProxyService_ProxyServer) error {
 	klog.V(2).InfoS("proxy request from client", "userAgent", userAgent)
 
 	recvCh := make(chan *client.Packet, xfrChannelSize)
-	recvActCh := make(chan struct{}, xfrChannelSize)
+	//	recvActCh := make(chan struct{}, xfrChannelSize)
 	stopCh := make(chan error)
 
-	go s.serveRecvFrontend(stream, recvCh)
+	go s.serveRecvFrontend(stream, recvCh, stopCh)
 
 	defer func() {
 		klog.V(2).InfoS("Receive channel on Proxy is stopping", "userAgent", userAgent, "serverID", s.serverID)
@@ -403,64 +403,70 @@ func (s *ProxyServer) Proxy(stream client.ProxyService_ProxyServer) error {
 			}
 
 			recvCh <- in
-			recvActCh <- struct{}{}
+			//		recvActCh <- struct{}{}
 		}
 	}()
 
-	// Wait to see if there is inactivity (no app layer payload received)
-	// and, if the proper flag was used, we will make this fuction finish.
-	// This finishes the grpc connection and frees up the resources used.
+	return <-stopCh
+
+	//	// Wait to see if there is inactivity (no app layer payload received)
+	//	// and, if the proper flag was used, we will make this fuction finish.
+	//	// This finishes the grpc connection and frees up the resources used.
+	//	//
+	//	// This is a work-around to help with issue #276 but also useful to
+	//	// mitigate any future leaks. Sometimes the fix is in the
+	//	// konnectivity-client and hard to backport, so having a knob here is
+	//	// super useful for some cloud providers to stop the bleeding until the
+	//	// leak is fixed/backported.
+	//	// We wait here instead of in the stream.Recv() because of limitations
+	//	// on gRPC to do that. This is actually the recommended way to do it.
+	//	// For more info, see:
+	//	// https://github.com/grpc/grpc-go/issues/445
+	//	// https://github.com/grpc/grpc-go/issues/445#issuecomment-354875629
+	//	// https://github.com/grpc/grpc-go/issues/1229#issuecomment-300938770
+	//	var ret error
 	//
-	// This is a work-around to help with issue #276 but also useful to
-	// mitigate any future leaks. Sometimes the fix is in the
-	// konnectivity-client and hard to backport, so having a knob here is
-	// super useful for some cloud providers to stop the bleeding until the
-	// leak is fixed/backported.
-	// We wait here instead of in the stream.Recv() because of limitations
-	// on gRPC to do that. This is actually the recommended way to do it.
-	// For more info, see:
-	// https://github.com/grpc/grpc-go/issues/445
-	// https://github.com/grpc/grpc-go/issues/445#issuecomment-354875629
-	// https://github.com/grpc/grpc-go/issues/1229#issuecomment-300938770
-	var ret error
-
-	// If this param is specified, we set a timer. Otherwise, the timer
-	// channel will never receive anything, therefore never fire and act as
-	// there is no inactivity timeout for this connection.
-	t := &time.Timer{}
-	if s.grpcMaxIdleTime != 0 {
-		t = time.NewTimer(s.grpcMaxIdleTime)
-	}
-
-loop:
-	for {
-		select {
-		case ret = <-stopCh:
-			break loop
-		case <-recvActCh:
-			// Some packet was received, reset idle timer.
-			klog.V(5).InfoS("Data received on connection, restarting activity timer", "userAgent", userAgent, "serverID", s.serverID)
-			if s.grpcMaxIdleTime != 0 {
-				t.Stop()
-				t.Reset(s.grpcMaxIdleTime)
-			}
-		case <-t.C:
-			klog.V(2).InfoS("Stopping connection due to inactivity", "userAgent", userAgent, "serverID", s.serverID)
-			return nil
-		}
-	}
-
-	return ret
+	//	// If this param is specified, we set a timer. Otherwise, the timer
+	//	// channel will never receive anything, therefore never fire and act as
+	//	// there is no inactivity timeout for this connection.
+	//	t := &time.Timer{}
+	//	if s.grpcMaxIdleTime != 0 {
+	//		t = time.NewTimer(s.grpcMaxIdleTime)
+	//	}
+	//
+	//loop:
+	//	for {
+	//		select {
+	//		case ret = <-stopCh:
+	//			break loop
+	//		case <-recvActCh:
+	//			// Some packet was received, reset idle timer.
+	//			klog.V(5).InfoS("Data received on connection, restarting activity timer", "userAgent", userAgent, "serverID", s.serverID)
+	//			if s.grpcMaxIdleTime != 0 {
+	//				t.Stop()
+	//				t.Reset(s.grpcMaxIdleTime)
+	//			}
+	//		case <-t.C:
+	//			klog.V(2).InfoS("Stopping connection due to inactivity", "userAgent", userAgent, "serverID", s.serverID)
+	//			close(recvCh)
+	//			break loop
+	//		}
+	//	}
+	//
+	//	return ret
 }
 
-func (s *ProxyServer) serveRecvFrontend(stream client.ProxyService_ProxyServer, recvCh <-chan *client.Packet) {
+func (s *ProxyServer) serveRecvFrontend(stream client.ProxyService_ProxyServer, recvCh chan *client.Packet, stopCh chan error) {
 	klog.V(4).Infoln("start serving frontend stream")
 
+	recvActCh := make(chan struct{}, xfrChannelSize)
 	var firstConnID int64
 	// The first packet should be a DIAL_REQ, we will randomly get a
 	// backend from the BackendManger then.
 	var backend Backend
 	var err error
+
+	var inactivityController bool
 
 	for pkt := range recvCh {
 		switch pkt.Type {
@@ -497,6 +503,11 @@ func (s *ProxyServer) serveRecvFrontend(stream client.ProxyService_ProxyServer, 
 				klog.ErrorS(err, "DIAL_REQ to Backend failed", "serverID", s.serverID)
 			}
 			klog.V(5).Infoln("DIAL_REQ sent to backend") // got this. but backend didn't receive anything.
+
+			// Set inactivityController as true, so that when the first packet of type PacketType_DATA
+			// is received, we fire up a goroutine which terminates any inactive and idle connections based
+			// on the timeout value of grpcMaxIdleTime.
+			inactivityController = true
 
 		case client.PacketType_CLOSE_REQ:
 			connID := pkt.GetCloseRequest().ConnectID
@@ -540,6 +551,17 @@ func (s *ProxyServer) serveRecvFrontend(stream client.ProxyService_ProxyServer, 
 			}
 			klog.V(5).Infoln("DATA sent to Backend")
 
+			if inactivityController {
+				go s.terminateIdleConnection(backend, connID, recvActCh, recvCh, stopCh)
+
+				// Set inactivityController to false again, as we only want to fire up the
+				// goroutine in the first reception of PacketType_Data
+				inactivityController = false
+			}
+
+			// Send to the channel to let the goroutine know of activity and to reset the idle timer.
+			recvActCh <- struct{}{}
+
 		default:
 			klog.V(5).InfoS("Ignore packet coming from frontend",
 				"type", pkt.Type, "serverID", s.serverID, "connectionID", firstConnID)
@@ -563,6 +585,49 @@ func (s *ProxyServer) serveRecvFrontend(stream client.ProxyService_ProxyServer, 
 	}
 	if err := backend.Send(pkt); err != nil {
 		klog.ErrorS(err, "CLOSE_REQ to Backend failed", "serverID", s.serverID)
+	}
+}
+
+func (s *ProxyServer) terminateIdleConnection(backend Backend, connID int64, recvActCh <-chan struct{}, recvCh chan *client.Packet, stopCh chan error) {
+	t := &time.Timer{}
+	if s.grpcMaxIdleTime != 0 {
+		t = time.NewTimer(s.grpcMaxIdleTime)
+	}
+
+	for {
+		select {
+		case <-stopCh:
+			klog.V(2).InfoS("received stop for", "connectionID", connID)
+			return
+		case <-recvActCh:
+			// Some packet was received, reset idle timer.
+			klog.V(5).InfoS("Data received on connection, restarting activity timer", "connectionID", connID, "serverID", s.serverID)
+			if s.grpcMaxIdleTime != 0 {
+				t.Stop()
+				t.Reset(s.grpcMaxIdleTime)
+			}
+		case <-t.C:
+			klog.V(2).InfoS("Stopping connection due to inactivity", "connectionID", connID, "serverID", s.serverID)
+			pkt := &client.Packet{
+				Type: client.PacketType_CLOSE_REQ,
+				Payload: &client.Packet_CloseRequest{
+					CloseRequest: &client.CloseRequest{
+						ConnectID: connID,
+					},
+				},
+			}
+
+			recvCh <- pkt
+			//	if backend == nil {
+			//		klog.V(2).InfoS("Backend has not been initialized for requested connection. Client should send a Dial Request first", "connectionID", connID)
+			//		return
+			//	}
+			//	if err := backend.Send(pkt); err != nil {
+			//		klog.ErrorS(err, "CLOSE_REQ to Backend failed", "serverID", s.serverID)
+			//	}
+			klog.V(5).Infoln("CLOSE_REQ sent to backend", "serverID", s.serverID, "connectionID", connID)
+			return
+		}
 	}
 }
 
