@@ -35,7 +35,6 @@ import (
 	pkgagent "sigs.k8s.io/apiserver-network-proxy/pkg/agent"
 	"sigs.k8s.io/apiserver-network-proxy/pkg/server/metrics"
 	"sigs.k8s.io/apiserver-network-proxy/pkg/util"
-	"sigs.k8s.io/apiserver-network-proxy/proto/agent"
 	"sigs.k8s.io/apiserver-network-proxy/proto/header"
 )
 
@@ -45,7 +44,7 @@ type key int
 
 type ProxyClientConnection struct {
 	Mode      string
-	Grpc      client.ProxyService_ProxyServer
+	Grpc      Sender
 	HTTP      io.ReadWriter
 	CloseHTTP func() error
 	connected chan struct{}
@@ -156,9 +155,9 @@ type AgentTokenAuthenticationOptions struct {
 	KubernetesClient       kubernetes.Interface
 }
 
-var _ agent.AgentServiceServer = &ProxyServer{}
+// var _ agent.AgentServiceServer = &ProxyServer{}
 
-var _ client.ProxyServiceServer = &ProxyServer{}
+// var _ client.ProxyServiceServer = &ProxyServer{}
 
 func genContext(proxyStrategies []ProxyStrategy, reqHost string) context.Context {
 	ctx := context.Background()
@@ -188,7 +187,7 @@ func (s *ProxyServer) getBackend(reqHost string) (Backend, error) {
 	return nil, &ErrNotFound{}
 }
 
-func (s *ProxyServer) addBackend(agentID string, conn agent.AgentService_ConnectServer) (backend Backend) {
+func (s *ProxyServer) addBackend(agentID string, conn Connection) (backend Backend) {
 	for i := 0; i < len(s.BackendManagers); i++ {
 		switch s.BackendManagers[i].(type) {
 		case *DestHostBackendManager:
@@ -198,15 +197,15 @@ func (s *ProxyServer) addBackend(agentID string, conn agent.AgentService_Connect
 				break
 			}
 			for _, ipv4 := range agentIdentifiers.IPv4 {
-				klog.V(5).InfoS("Add the agent to DestHostBackendManager", "agent address", ipv4)
+				klog.V(1).InfoS("Add the agent to DestHostBackendManager", "agent address", ipv4)
 				s.BackendManagers[i].AddBackend(ipv4, pkgagent.IPv4, conn)
 			}
 			for _, ipv6 := range agentIdentifiers.IPv6 {
-				klog.V(5).InfoS("Add the agent to DestHostBackendManager", "agent address", ipv6)
+				klog.V(1).InfoS("Add the agent to DestHostBackendManager", "agent address", ipv6)
 				s.BackendManagers[i].AddBackend(ipv6, pkgagent.IPv6, conn)
 			}
 			for _, host := range agentIdentifiers.Host {
-				klog.V(5).InfoS("Add the agent to DestHostBackendManager", "agent address", host)
+				klog.V(1).InfoS("Add the agent to DestHostBackendManager", "agent address", host)
 				s.BackendManagers[i].AddBackend(host, pkgagent.Host, conn)
 			}
 		case *DefaultRouteBackendManager:
@@ -216,18 +215,18 @@ func (s *ProxyServer) addBackend(agentID string, conn agent.AgentService_Connect
 				break
 			}
 			if agentIdentifiers.DefaultRoute {
-				klog.V(5).InfoS("Add the agent to DefaultRouteBackendManager", "agentID", agentID)
+				klog.V(1).InfoS("Add the agent to DefaultRouteBackendManager", "agentID", agentID)
 				backend = s.BackendManagers[i].AddBackend(agentID, pkgagent.DefaultRoute, conn)
 			}
 		default:
-			klog.V(5).InfoS("Add the agent to DefaultBackendManager", "agentID", agentID)
+			klog.V(1).InfoS("Add the agent to DefaultBackendManager", "agentID", agentID)
 			backend = s.BackendManagers[i].AddBackend(agentID, pkgagent.UID, conn)
 		}
 	}
 	return
 }
 
-func (s *ProxyServer) removeBackend(agentID string, conn agent.AgentService_ConnectServer) {
+func (s *ProxyServer) removeBackend(agentID string, conn Connection) {
 	for _, bm := range s.BackendManagers {
 		switch bm.(type) {
 		case *DestHostBackendManager:
@@ -237,15 +236,15 @@ func (s *ProxyServer) removeBackend(agentID string, conn agent.AgentService_Conn
 				break
 			}
 			for _, ipv4 := range agentIdentifiers.IPv4 {
-				klog.V(5).InfoS("Remove the agent from the DestHostBackendManager", "agentHost", ipv4)
+				klog.V(1).InfoS("Remove the agent from the DestHostBackendManager", "agentHost", ipv4)
 				bm.RemoveBackend(ipv4, pkgagent.IPv4, conn)
 			}
 			for _, ipv6 := range agentIdentifiers.IPv6 {
-				klog.V(5).InfoS("Remove the agent from the DestHostBackendManager", "agentHost", ipv6)
+				klog.V(1).InfoS("Remove the agent from the DestHostBackendManager", "agentHost", ipv6)
 				bm.RemoveBackend(ipv6, pkgagent.IPv6, conn)
 			}
 			for _, host := range agentIdentifiers.Host {
-				klog.V(5).InfoS("Remove the agent from the DestHostBackendManager", "agentHost", host)
+				klog.V(1).InfoS("Remove the agent from the DestHostBackendManager", "agentHost", host)
 				bm.RemoveBackend(host, pkgagent.Host, conn)
 			}
 		case *DefaultRouteBackendManager:
@@ -255,18 +254,18 @@ func (s *ProxyServer) removeBackend(agentID string, conn agent.AgentService_Conn
 				break
 			}
 			if agentIdentifiers.DefaultRoute {
-				klog.V(5).InfoS("Remove the agent from the DefaultRouteBackendManager", "agentID", agentID)
+				klog.V(1).InfoS("Remove the agent from the DefaultRouteBackendManager", "agentID", agentID)
 				bm.RemoveBackend(agentID, pkgagent.DefaultRoute, conn)
 			}
 		default:
-			klog.V(5).InfoS("Remove the agent from the DefaultBackendManager", "agentID", agentID)
+			klog.V(1).InfoS("Remove the agent from the DefaultBackendManager", "agentID", agentID)
 			bm.RemoveBackend(agentID, pkgagent.UID, conn)
 		}
 	}
 }
 
 func (s *ProxyServer) addFrontend(agentID string, connID int64, p *ProxyClientConnection) {
-	klog.V(2).InfoS("Register frontend for agent", "frontend", p, "agentID", agentID, "connectionID", connID)
+	klog.V(1).InfoS("Register frontend for agent", "frontend", p, "agentID", agentID, "connectionID", connID)
 	s.fmu.Lock()
 	defer s.fmu.Unlock()
 	if _, ok := s.frontends[agentID]; !ok {
@@ -280,14 +279,14 @@ func (s *ProxyServer) removeFrontend(agentID string, connID int64) {
 	defer s.fmu.Unlock()
 	conns, ok := s.frontends[agentID]
 	if !ok {
-		klog.V(2).InfoS("Cannot find agent in the frontends", "agentID", agentID)
+		klog.V(1).InfoS("Cannot find agent in the frontends", "agentID", agentID)
 		return
 	}
 	if _, ok := conns[connID]; !ok {
-		klog.V(2).InfoS("Cannot find connection for agent in the frontends", "connectionID", connID, "agentID", agentID)
+		klog.V(1).InfoS("Cannot find connection for agent in the frontends", "connectionID", connID, "agentID", agentID)
 		return
 	}
-	klog.V(2).InfoS("Remove frontend for agent", "frontend", conns[connID], "agentID", agentID, "connectionID", connID)
+	klog.V(1).InfoS("Remove frontend for agent", "frontend", conns[connID], "agentID", agentID, "connectionID", connID)
 	delete(s.frontends[agentID], connID)
 	if len(s.frontends[agentID]) == 0 {
 		delete(s.frontends, agentID)
@@ -355,8 +354,18 @@ func NewProxyServer(serverID string, proxyStrategies []ProxyStrategy, serverCoun
 	}
 }
 
+type Connection interface {
+	Context() context.Context
+	Recv() (*client.Packet, error)
+	Sender
+}
+
+type Sender interface {
+	Send(*client.Packet) error
+}
+
 // Proxy handles incoming streams from gRPC frontend.
-func (s *ProxyServer) Proxy(stream client.ProxyService_ProxyServer) error {
+func (s *ProxyServer) Proxy(stream Connection) error {
 	metrics.Metrics.ConnectionInc(metrics.Proxy)
 	defer metrics.Metrics.ConnectionDec(metrics.Proxy)
 
@@ -365,7 +374,7 @@ func (s *ProxyServer) Proxy(stream client.ProxyService_ProxyServer) error {
 		return fmt.Errorf("failed to get context")
 	}
 	userAgent := md.Get(header.UserAgent)
-	klog.V(2).InfoS("proxy request from client", "userAgent", userAgent)
+	klog.V(1).InfoS("proxy request from client", "userAgent", userAgent)
 
 	recvCh := make(chan *client.Packet, xfrChannelSize)
 	stopCh := make(chan error)
@@ -373,7 +382,7 @@ func (s *ProxyServer) Proxy(stream client.ProxyService_ProxyServer) error {
 	go s.serveRecvFrontend(stream, recvCh)
 
 	defer func() {
-		klog.V(2).InfoS("Receive channel on Proxy is stopping", "userAgent", userAgent, "serverID", s.serverID)
+		klog.V(1).InfoS("Receive channel on Proxy is stopping", "userAgent", userAgent, "serverID", s.serverID)
 		close(recvCh)
 	}()
 
@@ -382,7 +391,7 @@ func (s *ProxyServer) Proxy(stream client.ProxyService_ProxyServer) error {
 		for {
 			in, err := stream.Recv()
 			if err == io.EOF {
-				klog.V(2).InfoS("Stream closed on Proxy", "userAgent", userAgent, "serverID", s.serverID)
+				klog.V(1).InfoS("Stream closed on Proxy", "userAgent", userAgent, "serverID", s.serverID)
 				close(stopCh)
 				return
 			}
@@ -394,7 +403,7 @@ func (s *ProxyServer) Proxy(stream client.ProxyService_ProxyServer) error {
 			}
 
 			if s.warnOnChannelLimit && len(recvCh) >= xfrChannelSize {
-				klog.V(2).InfoS("Receive channel on Proxy is full", "userAgent", userAgent, "serverID", s.serverID)
+				klog.V(1).InfoS("Receive channel on Proxy is full", "userAgent", userAgent, "serverID", s.serverID)
 			}
 			recvCh <- in
 		}
@@ -403,7 +412,7 @@ func (s *ProxyServer) Proxy(stream client.ProxyService_ProxyServer) error {
 	return <-stopCh
 }
 
-func (s *ProxyServer) serveRecvFrontend(stream client.ProxyService_ProxyServer, recvCh <-chan *client.Packet) {
+func (s *ProxyServer) serveRecvFrontend(stream Sender, recvCh <-chan *client.Packet) {
 	klog.V(4).Infoln("start serving frontend stream")
 
 	var firstConnID int64
@@ -415,7 +424,7 @@ func (s *ProxyServer) serveRecvFrontend(stream client.ProxyService_ProxyServer, 
 	for pkt := range recvCh {
 		switch pkt.Type {
 		case client.PacketType_DIAL_REQ:
-			klog.V(5).Infoln("Received DIAL_REQ")
+			klog.V(1).Infoln("Received DIAL_REQ")
 			// TODO: if we track what agent has historically served
 			// the address, then we can send the Dial_REQ to the
 			// same agent. That way we save the agent from creating
@@ -429,7 +438,7 @@ func (s *ProxyServer) serveRecvFrontend(stream client.ProxyService_ProxyServer, 
 					Payload: &client.Packet_DialResponse{DialResponse: &client.DialResponse{Error: err.Error()}},
 				}
 				if err := stream.Send(resp); err != nil {
-					klog.V(5).Infoln("Failed to send DIAL_RSP for no backend", "error", err, "serverID", s.serverID)
+					klog.V(1).Infoln("Failed to send DIAL_RSP for no backend", "error", err, "serverID", s.serverID)
 				}
 				// The Dial is failing; no reason to keep this goroutine.
 				return
@@ -446,13 +455,13 @@ func (s *ProxyServer) serveRecvFrontend(stream client.ProxyService_ProxyServer, 
 			if err := backend.Send(pkt); err != nil {
 				klog.ErrorS(err, "DIAL_REQ to Backend failed", "serverID", s.serverID)
 			}
-			klog.V(5).Infoln("DIAL_REQ sent to backend") // got this. but backend didn't receive anything.
+			klog.V(1).Infoln("DIAL_REQ sent to backend") // got this. but backend didn't receive anything.
 
 		case client.PacketType_CLOSE_REQ:
 			connID := pkt.GetCloseRequest().ConnectID
-			klog.V(5).InfoS("Received CLOSE_REQ", "connectionID", connID)
+			klog.V(1).InfoS("Received CLOSE_REQ", "connectionID", connID)
 			if backend == nil {
-				klog.V(2).InfoS("Backend has not been initialized for requested connection. Client should send a Dial Request first",
+				klog.V(1).InfoS("Backend has not been initialized for requested connection. Client should send a Dial Request first",
 					"serverID", s.serverID, "connectionID", connID)
 				continue
 			}
@@ -460,27 +469,27 @@ func (s *ProxyServer) serveRecvFrontend(stream client.ProxyService_ProxyServer, 
 				// TODO: retry with other backends connecting to this agent.
 				klog.ErrorS(err, "CLOSE_REQ to Backend failed", "serverID", s.serverID, "connectionID", connID)
 			}
-			klog.V(5).Infoln("CLOSE_REQ sent to backend", "serverID", s.serverID, "connectionID", connID)
+			klog.V(1).Infoln("CLOSE_REQ sent to backend", "serverID", s.serverID, "connectionID", connID)
 
 		case client.PacketType_DIAL_CLS:
 			random := pkt.GetCloseDial().Random
-			klog.V(5).InfoS("Received DIAL_CLOSE", "serverID", s.serverID, "dialID", random)
+			klog.V(1).InfoS("Received DIAL_CLOSE", "serverID", s.serverID, "dialID", random)
 			// Currently not worrying about backend as we do not have an established connection,
 			s.PendingDial.Remove(random)
-			klog.V(5).Infoln("Removing pending dial request", "serverID", s.serverID, "dialID", random)
+			klog.V(1).Infoln("Removing pending dial request", "serverID", s.serverID, "dialID", random)
 
 		case client.PacketType_DATA:
 			connID := pkt.GetData().ConnectID
 			data := pkt.GetData().Data
-			klog.V(5).InfoS("Received data from connection", "bytes", len(data), "connectionID", connID)
+			klog.V(1).InfoS("Received data from connection", "bytes", len(data), "connectionID", connID)
 			if firstConnID == 0 {
 				firstConnID = connID
 			} else if firstConnID != connID {
-				klog.V(5).InfoS("Data does not match first connection id", "fistConnectionID", firstConnID, "connectionID", connID)
+				klog.V(1).InfoS("Data does not match first connection id", "fistConnectionID", firstConnID, "connectionID", connID)
 			}
 
 			if backend == nil {
-				klog.V(2).InfoS("Backend has not been initialized for the connection. Client should send a Dial Request first", "connectionID", connID)
+				klog.V(1).InfoS("Backend has not been initialized for the connection. Client should send a Dial Request first", "connectionID", connID)
 				continue
 			}
 			if err := backend.Send(pkt); err != nil {
@@ -488,15 +497,15 @@ func (s *ProxyServer) serveRecvFrontend(stream client.ProxyService_ProxyServer, 
 				klog.ErrorS(err, "DATA to Backend failed", "serverID", s.serverID, "connectionID", connID)
 				continue
 			}
-			klog.V(5).Infoln("DATA sent to Backend")
+			klog.V(1).Infoln("DATA sent to Backend")
 
 		default:
-			klog.V(5).InfoS("Ignore packet coming from frontend",
+			klog.V(1).InfoS("Ignore packet coming from frontend",
 				"type", pkt.Type, "serverID", s.serverID, "connectionID", firstConnID)
 		}
 	}
 
-	klog.V(5).InfoS("Close streaming", "serverID", s.serverID, "connectionID", firstConnID)
+	klog.V(1).InfoS("Close streaming", "serverID", s.serverID, "connectionID", firstConnID)
 
 	pkt := &client.Packet{
 		Type: client.PacketType_CLOSE_REQ,
@@ -508,7 +517,7 @@ func (s *ProxyServer) serveRecvFrontend(stream client.ProxyService_ProxyServer, 
 	}
 
 	if backend == nil {
-		klog.V(2).InfoS("Backend has not been initialized for requested connection. Client should send a Dial Request first", "connectionID", firstConnID)
+		klog.V(1).InfoS("Backend has not been initialized for requested connection. Client should send a Dial Request first", "connectionID", firstConnID)
 		return
 	}
 	if err := backend.Send(pkt); err != nil {
@@ -516,8 +525,8 @@ func (s *ProxyServer) serveRecvFrontend(stream client.ProxyService_ProxyServer, 
 	}
 }
 
-func agentID(stream agent.AgentService_ConnectServer) (string, error) {
-	md, ok := metadata.FromIncomingContext(stream.Context())
+func agentID(ctx context.Context) (string, error) {
+	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
 		return "", fmt.Errorf("failed to get context")
 	}
@@ -528,7 +537,7 @@ func agentID(stream agent.AgentService_ConnectServer) (string, error) {
 	return agentIDs[0], nil
 }
 
-func getAgentIdentifiers(stream agent.AgentService_ConnectServer) (pkgagent.Identifiers, error) {
+func getAgentIdentifiers(stream Connection) (pkgagent.Identifiers, error) {
 	var agentIdentifiers pkgagent.Identifiers
 	md, ok := metadata.FromIncomingContext(stream.Context())
 	if !ok {
@@ -615,21 +624,26 @@ func (s *ProxyServer) authenticateAgentViaToken(ctx context.Context) error {
 		return fmt.Errorf("Failed to validate authentication token, err:%v", err)
 	}
 
-	klog.V(2).Infoln("Client successfully authenticated via token")
+	klog.V(1).Infoln("Client successfully authenticated via token")
 	return nil
 }
 
+type Connector interface {
+	Connection
+	SendHeader(metadata.MD) error
+}
+
 // Connect is for agent to connect to ProxyServer as next hop
-func (s *ProxyServer) Connect(stream agent.AgentService_ConnectServer) error {
+func (s *ProxyServer) Connect(stream Connector) error {
 	metrics.Metrics.ConnectionInc(metrics.Connect)
 	defer metrics.Metrics.ConnectionDec(metrics.Connect)
 
-	agentID, err := agentID(stream)
+	agentID, err := agentID(stream.Context())
 	if err != nil {
 		return err
 	}
 
-	klog.V(2).InfoS("Connect request from agent", "agentID", agentID)
+	klog.V(1).InfoS("Connect request from agent", "agentID", agentID)
 
 	if s.AgentAuthenticationOptions.Enabled {
 		if err := s.authenticateAgentViaToken(stream.Context()); err != nil {
@@ -652,7 +666,7 @@ func (s *ProxyServer) Connect(stream agent.AgentService_ConnectServer) error {
 	go s.serveRecvBackend(backend, stream, agentID, recvCh)
 
 	defer func() {
-		klog.V(2).InfoS("Receive channel on Connect is stopping", "agentID", agentID, "serverID", s.serverID)
+		klog.V(1).InfoS("Receive channel on Connect is stopping", "agentID", agentID, "serverID", s.serverID)
 		close(recvCh)
 	}()
 
@@ -661,7 +675,7 @@ func (s *ProxyServer) Connect(stream agent.AgentService_ConnectServer) error {
 		for {
 			in, err := stream.Recv()
 			if err == io.EOF {
-				klog.V(2).InfoS("Stream closed on Connect", "agentID", agentID, "serverID", s.serverID)
+				klog.V(1).InfoS("Stream closed on Connect", "agentID", agentID, "serverID", s.serverID)
 				close(stopCh)
 				return
 			}
@@ -673,7 +687,7 @@ func (s *ProxyServer) Connect(stream agent.AgentService_ConnectServer) error {
 			}
 
 			if s.warnOnChannelLimit && len(recvCh) >= xfrChannelSize {
-				klog.V(2).InfoS("Receive channel on Connect is full", "agentID", agentID, "serverID", s.serverID)
+				klog.V(1).InfoS("Receive channel on Connect is full", "agentID", agentID, "serverID", s.serverID)
 			}
 			recvCh <- in
 		}
@@ -683,7 +697,7 @@ func (s *ProxyServer) Connect(stream agent.AgentService_ConnectServer) error {
 }
 
 // route the packet back to the correct client
-func (s *ProxyServer) serveRecvBackend(backend Backend, stream agent.AgentService_ConnectServer, agentID string, recvCh <-chan *client.Packet) {
+func (s *ProxyServer) serveRecvBackend(backend Backend, stream Connection, agentID string, recvCh <-chan *client.Packet) {
 	defer func() {
 		// Close all connected frontends when the agent connection is closed
 		// TODO(#126): Frontends in PendingDial state that have not been added to the
@@ -711,29 +725,33 @@ func (s *ProxyServer) serveRecvBackend(backend Backend, stream agent.AgentServic
 		switch pkt.Type {
 		case client.PacketType_DIAL_RSP:
 			resp := pkt.GetDialResponse()
-			klog.V(5).InfoS("Received DIAL_RSP", "dialID", resp.Random, "agentID", agentID, "connectionID", resp.ConnectID)
+			klog.V(1).InfoS("Received DIAL_RSP", "dialID", resp.Random, "agentID", agentID, "connectionID", resp.ConnectID)
 
 			if frontend, ok := s.PendingDial.Get(resp.Random); !ok {
-				klog.V(2).Infoln("DIAL_RSP not recognized; dropped", "dialID", resp.Random, "agentID", agentID, "connectionID", resp.ConnectID)
+				klog.V(1).Infoln("DIAL_RSP not recognized; dropped", "dialID", resp.Random, "agentID", agentID, "connectionID", resp.ConnectID)
 			} else {
 				dialErr := false
 				if resp.Error != "" {
+
 					klog.ErrorS(errors.New(resp.Error), "DIAL_RSP contains failure", "dialID", resp.Random, "agentID", agentID, "connectionID", resp.ConnectID)
 					dialErr = true
 				}
 				err := frontend.send(pkt)
 				s.PendingDial.Remove(resp.Random)
 				if err != nil {
+
 					klog.ErrorS(err, "DIAL_RSP send to frontend stream failure",
 						"dialID", resp.Random, "serverID", s.serverID, "agentID", agentID, "connectionID", resp.ConnectID)
 					dialErr = true
 				}
+
 				// Avoid adding the frontend if there was an error dialing the destination
 				if dialErr == true {
 					break
 				}
 				frontend.connectID = resp.ConnectID
 				frontend.agentID = agentID
+
 				s.addFrontend(agentID, resp.ConnectID, frontend)
 				close(frontend.connected)
 				metrics.Metrics.ObserveDialLatency(time.Since(frontend.start))
@@ -741,7 +759,7 @@ func (s *ProxyServer) serveRecvBackend(backend Backend, stream agent.AgentServic
 
 		case client.PacketType_DATA:
 			resp := pkt.GetData()
-			klog.V(5).InfoS("Received data from agent", "bytes", len(resp.Data), "agentID", agentID, "connectionID", resp.ConnectID)
+			klog.V(1).InfoS("Received data from agent", "bytes", len(resp.Data), "agentID", agentID, "connectionID", resp.ConnectID)
 			frontend, err := s.getFrontend(agentID, resp.ConnectID)
 			if err != nil {
 				klog.ErrorS(err, "could not get frontend client", "serverID", s.serverID, "agentID", agentID, "connectionID", resp.ConnectID)
@@ -750,12 +768,12 @@ func (s *ProxyServer) serveRecvBackend(backend Backend, stream agent.AgentServic
 			if err := frontend.send(pkt); err != nil {
 				klog.ErrorS(err, "send to client stream failure", "serverID", s.serverID, "agentID", agentID, "connectionID", resp.ConnectID)
 			} else {
-				klog.V(5).InfoS("DATA sent to frontend")
+				klog.V(1).InfoS("DATA sent to frontend")
 			}
 
 		case client.PacketType_CLOSE_RSP:
 			resp := pkt.GetCloseResponse()
-			klog.V(5).InfoS("Received CLOSE_RSP", "serverID", s.serverID, "agentID", agentID, "connectionID", resp.ConnectID)
+			klog.V(1).InfoS("Received CLOSE_RSP", "serverID", s.serverID, "agentID", agentID, "connectionID", resp.ConnectID)
 			frontend, err := s.getFrontend(agentID, resp.ConnectID)
 			if err != nil {
 				klog.ErrorS(err, "could not get frontend client", "serverID", s.serverID, "agentID", agentID, "connectionID", resp.ConnectID)
@@ -765,14 +783,14 @@ func (s *ProxyServer) serveRecvBackend(backend Backend, stream agent.AgentServic
 				// Normal when frontend closes it.
 				klog.ErrorS(err, "CLOSE_RSP send to client stream error", "serverID", s.serverID, "agentID", agentID, "connectionID", resp.ConnectID)
 			} else {
-				klog.V(5).Infoln("CLOSE_RSP sent to frontend", "connectionID", resp.ConnectID)
+				klog.V(1).Infoln("CLOSE_RSP sent to frontend", "connectionID", resp.ConnectID)
 			}
 			s.removeFrontend(agentID, resp.ConnectID)
-			klog.V(5).InfoS("Close streaming", "agentID", agentID, "connectionID", resp.ConnectID)
+			klog.V(1).InfoS("Close streaming", "agentID", agentID, "connectionID", resp.ConnectID)
 
 		default:
-			klog.V(2).InfoS("Unrecognized packet", "packet", pkt, "serverID", s.serverID, "agentID", agentID)
+			klog.V(1).InfoS("Unrecognized packet", "packet", pkt, "serverID", s.serverID, "agentID", agentID)
 		}
 	}
-	klog.V(5).InfoS("Close backend of agent", "backend", stream, "serverID", s.serverID, "agentID", agentID)
+	klog.V(1).InfoS("Close backend of agent", "backend", stream, "serverID", s.serverID, "agentID", agentID)
 }

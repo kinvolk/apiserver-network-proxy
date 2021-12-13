@@ -334,7 +334,6 @@ func TestBasicProxy_HTTPCONN(t *testing.T) {
 	if string(data) != "hello" {
 		t.Errorf("expect %v; got %v", "hello", string(data))
 	}
-
 }
 
 func TestFailedDial_HTTPCONN(t *testing.T) {

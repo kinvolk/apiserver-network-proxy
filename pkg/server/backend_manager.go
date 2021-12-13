@@ -28,7 +28,6 @@ import (
 	client "sigs.k8s.io/apiserver-network-proxy/konnectivity-client/proto/client"
 	pkgagent "sigs.k8s.io/apiserver-network-proxy/pkg/agent"
 	"sigs.k8s.io/apiserver-network-proxy/pkg/server/metrics"
-	"sigs.k8s.io/apiserver-network-proxy/proto/agent"
 )
 
 type ProxyStrategy string
@@ -72,14 +71,16 @@ type Backend interface {
 	Context() context.Context
 }
 
-var _ Backend = &backend{}
-var _ Backend = agent.AgentService_ConnectServer(nil)
+var (
+	_ Backend = &backend{}
+	_ Backend = Connection(nil)
+)
 
 type backend struct {
 	// TODO: this is a multi-writer single-reader pattern, it's tricky to
 	// write it using channel. Let's worry about performance later.
 	mu   sync.Mutex // mu protects conn
-	conn agent.AgentService_ConnectServer
+	conn Connection // Connection
 }
 
 func (b *backend) Send(p *client.Packet) error {
@@ -93,7 +94,7 @@ func (b *backend) Context() context.Context {
 	return b.conn.Context()
 }
 
-func newBackend(conn agent.AgentService_ConnectServer) *backend {
+func newBackend(conn Connection) *backend {
 	return &backend{conn: conn}
 }
 
@@ -101,9 +102,9 @@ func newBackend(conn agent.AgentService_ConnectServer) *backend {
 // connections, i.e., get, add and remove
 type BackendStorage interface {
 	// AddBackend adds a backend.
-	AddBackend(identifier string, idType pkgagent.IdentifierType, conn agent.AgentService_ConnectServer) Backend
+	AddBackend(identifier string, idType pkgagent.IdentifierType, conn Connection) Backend
 	// RemoveBackend removes a backend.
-	RemoveBackend(identifier string, idType pkgagent.IdentifierType, conn agent.AgentService_ConnectServer)
+	RemoveBackend(identifier string, idType pkgagent.IdentifierType, conn Connection)
 	// NumBackends returns the number of backends.
 	NumBackends() int
 }
@@ -135,7 +136,7 @@ func (dbm *DefaultBackendManager) Backend(_ context.Context) (Backend, error) {
 
 // DefaultBackendStorage is the default backend storage.
 type DefaultBackendStorage struct {
-	mu sync.RWMutex //protects the following
+	mu sync.RWMutex // protects the following
 	// A map between agentID and its grpc connections.
 	// For a given agent, ProxyServer prefers backends[agentID][0] to send
 	// traffic, because backends[agentID][1:] are more likely to be closed
@@ -161,7 +162,8 @@ type DefaultBackendStorage struct {
 func NewDefaultBackendManager() *DefaultBackendManager {
 	return &DefaultBackendManager{
 		DefaultBackendStorage: NewDefaultBackendStorage(
-			[]pkgagent.IdentifierType{pkgagent.UID})}
+			[]pkgagent.IdentifierType{pkgagent.UID}),
+	}
 }
 
 // NewDefaultBackendStorage returns a DefaultBackendStorage
@@ -183,7 +185,7 @@ func containIDType(idTypes []pkgagent.IdentifierType, idType pkgagent.Identifier
 }
 
 // AddBackend adds a backend.
-func (s *DefaultBackendStorage) AddBackend(identifier string, idType pkgagent.IdentifierType, conn agent.AgentService_ConnectServer) Backend {
+func (s *DefaultBackendStorage) AddBackend(identifier string, idType pkgagent.IdentifierType, conn Connection) Backend {
 	if !containIDType(s.idTypes, idType) {
 		klog.V(4).InfoS("fail to add backend", "backend", identifier, "error", &ErrWrongIDType{idType, s.idTypes})
 		return nil
@@ -194,6 +196,7 @@ func (s *DefaultBackendStorage) AddBackend(identifier string, idType pkgagent.Id
 	_, ok := s.backends[identifier]
 	addedBackend := newBackend(conn)
 	if ok {
+		fmt.Println("it does")
 		for _, v := range s.backends[identifier] {
 			if v.conn == conn {
 				klog.V(1).InfoS("This should not happen. Adding existing backend for agent", "connection", conn, "agentID", identifier)
@@ -209,11 +212,12 @@ func (s *DefaultBackendStorage) AddBackend(identifier string, idType pkgagent.Id
 	if idType == pkgagent.DefaultRoute {
 		s.defaultRouteAgentIDs = append(s.defaultRouteAgentIDs, identifier)
 	}
+
 	return addedBackend
 }
 
 // RemoveBackend removes a backend.
-func (s *DefaultBackendStorage) RemoveBackend(identifier string, idType pkgagent.IdentifierType, conn agent.AgentService_ConnectServer) {
+func (s *DefaultBackendStorage) RemoveBackend(identifier string, idType pkgagent.IdentifierType, conn Connection) {
 	if !containIDType(s.idTypes, idType) {
 		klog.ErrorS(&ErrWrongIDType{idType, s.idTypes}, "fail to remove backend")
 		return
