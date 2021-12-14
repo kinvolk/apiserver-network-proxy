@@ -223,45 +223,55 @@ func (c *mockStream) SendHeader(h metadata.MD) error {
 func Test_NewProxyServer(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreTopFunction("k8s.io/klog/v2.(*loggingT).flushDaemon"))
 
-	done := make(chan error)
+	operationTimeout := 1 * time.Second
+	operationTimer := time.NewTimer(operationTimeout)
+
+	testProxyServer := server.NewProxyServer("foo", []server.ProxyStrategy{server.ProxyStrategyDefault}, 1, &server.AgentTokenAuthenticationOptions{}, false)
+
+	agentSends := make(chan *client.Packet)
+	agentDone := make(chan error)
+	agentReceives := make(chan *client.Packet)
+
+	var wg sync.WaitGroup
 
 	go func() {
-		testProxyServer := server.NewProxyServer("foo", []server.ProxyStrategy{server.ProxyStrategyDefault}, 1, &server.AgentTokenAuthenticationOptions{}, false)
+		t.Log("Agent started")
 
-		agentSends := make(chan *client.Packet)
-		agentDone := make(chan error)
-		agentReceives := make(chan *client.Packet)
+		// Connect registers backend in the proxy server.
+		agentDone <- testProxyServer.Connect(&mockStream{
+			receive: agentSends,
+			t:       t,
+			send:    agentReceives,
+		})
 
-		var wg sync.WaitGroup
+		t.Log("Agent exited")
+	}()
 
-		go func() {
-			t.Log("Agent started")
+	proxyClientSends := make(chan *client.Packet)
+	proxyClientDone := make(chan error)
+	proxyClientReceives := make(chan *client.Packet)
 
-			// Connect registers backend in the proxy server.
-			agentDone <- testProxyServer.Connect(&mockStream{
-				receive: agentSends,
-				t:       t,
-				send:    agentReceives,
-			})
+	proxyClientsCount := 0
 
-			t.Log("Agent exited")
-		}()
+	// Requesting proxy connection to 1.1.1.1.
+	//
+	// This request will be forwarded to the backend.
 
-		proxyClientSends := make(chan *client.Packet)
-		proxyClientDone := make(chan error)
-		proxyClientReceives := make(chan *client.Packet)
+	func() {
+		agentResponded := false
 
-		// Requesting proxy connection to 1.1.1.1.
-		//
-		// This request will be forwarded to the backend.
-		func() {
-			agentResponded := false
-
-			for {
+		tr := time.NewTimer(operationTimeout)
+		for {
+			select {
+			case <-tr.C:
+				t.Fatalf("Timed out connecting to backend")
+			default:
 				if !agentResponded {
 					// If proxy responds with no backend error, connection proxy will be closed, so we need to start it again.
 					go func() {
 						t.Log("Proxy started")
+						proxyClientsCount += 1
+
 						wg.Add(1)
 
 						proxyClientDone <- testProxyServer.Proxy(&mockStream{
@@ -276,7 +286,10 @@ func Test_NewProxyServer(t *testing.T) {
 
 					t.Log("Sending dial request")
 
-					proxyClientSends <- &client.Packet{
+					operationTimer.Reset(operationTimeout)
+
+					select {
+					case proxyClientSends <- &client.Packet{
 						Type: client.PacketType_DIAL_REQ,
 						Payload: &client.Packet_DialRequest{
 							DialRequest: &client.DialRequest{
@@ -284,22 +297,32 @@ func Test_NewProxyServer(t *testing.T) {
 								Random:  1,
 							},
 						},
+					}:
+					case <-operationTimer.C:
+						t.Fatalf("Timed out sending dial request to proxy client")
 					}
 				}
 
 				t.Log("Waiting for proxy server to respond")
 
+				operationTimer.Reset(operationTimeout)
 				select {
 				case <-agentReceives:
 					t.Log("Backend registered, responding with agent response")
+
+					operationTimer.Reset(operationTimeout)
 					// For dial request, proxy responds with dial response.
-					agentSends <- &client.Packet{
+					select {
+					case agentSends <- &client.Packet{
 						Type: client.PacketType_DIAL_RSP,
 						Payload: &client.Packet_DialResponse{
 							DialResponse: &client.DialResponse{
 								Random: 1,
 							},
 						},
+					}:
+					case <-operationTimer.C:
+						t.Fatalf("Timed out sending agent response")
 					}
 
 					agentResponded = true
@@ -316,73 +339,107 @@ func Test_NewProxyServer(t *testing.T) {
 					t.Log("Terminating existing proxy stream")
 					// TODO: Client must send io.EOF over stream in case of no backend error?
 					// Otherwise receiving loop exits, but Recv will keep pushing data.
-					proxyClientSends <- nil
+					operationTimer.Reset(operationTimeout)
+					select {
+					case proxyClientSends <- nil:
+					case <-operationTimer.C:
+						t.Fatalf("Timed out closing proxy client stream")
+					}
+				case <-operationTimer.C:
+					t.Fatalf("Timed out waiting for proxy server to respond")
 				}
 			}
-		}()
-
-		t.Log("Closing proxy client connection")
-
-		proxyClientSends <- nil
-
-		t.Logf("Agent received: %v", <-agentReceives)
-
-		t.Log("Waiting for all started proxy clients to exit")
-
-		go func() {
-			wg.Add(1)
-
-			for err := range proxyClientDone {
-				if err != nil {
-					t.Fatalf("Unexpected error from proxy: %v", err)
-				}
-			}
-
-			wg.Done()
-		}()
-
-		t.Log("Proxy client exited")
-
-		agentSends <- nil
-
-		t.Log("Waiting for agent to exit")
-
-		if err := <-agentDone; err != nil {
-			t.Fatalf("Got unexpected error while connecting: %v", err)
 		}
-
-		t.Logf("Proxy client receives after exiting!: %v", <-proxyClientReceives)
-
-		close(proxyClientReceives)
-		close(agentReceives)
-
-		close(proxyClientDone)
-
-		t.Log("Waiting for all goroutines to exit")
-
-		wg.Wait()
-
-		for f := range proxyClientReceives {
-			t.Fatalf("Unexpected message received by proxy client after exiting: %v", f)
-		}
-		for f := range agentReceives {
-			t.Fatalf("Unexpected message received by agent after exiting: %v", f)
-		}
-
-		done <- nil
 	}()
 
-	timeout := time.NewTimer(30 * time.Second)
+	t.Log("Closing proxy client connection")
 
+	// This closes test stream.
+	proxyClientSends <- nil
+
+	// TODO: If no data packets is send over connection, connection ID is 0.
+	operationTimer.Reset(operationTimeout)
 	select {
-	case <-done:
-	case <-timeout.C:
-		t.Log("timeout")
+	case agentReceivedValue := <-agentReceives:
+		t.Logf("Agent received: %v", agentReceivedValue)
+	case <-operationTimer.C:
+		t.Fatalf("Timed out waiting for agent to receive response")
+	}
+
+	t.Log("Waiting for all started proxy clients to exit")
+
+	for i := 0; i < proxyClientsCount; i++ {
+		operationTimer.Reset(operationTimeout)
+
+		select {
+		case err := <-proxyClientDone:
+			if err != nil {
+				t.Fatalf("Unexpected error from proxy: %v", err)
+			}
+		case <-operationTimer.C:
+			t.Fatalf("Timed out waiting for proxy client to exit")
+		}
+	}
+
+	t.Log("Proxy client exited")
+
+	operationTimer.Reset(operationTimeout)
+	select {
+	case agentSends <- nil:
+	case <-operationTimer.C:
+		t.Fatalf("Timed out closing agent stream")
+	}
+
+	t.Log("Waiting for agent to exit")
+
+	operationTimer.Reset(operationTimeout)
+	select {
+	case err := <-agentDone:
+		if err != nil {
+			t.Fatalf("Got unexpected error while connecting: %v", err)
+		}
+	case <-operationTimer.C:
+		t.Fatalf("Timed out waiting for agent to exit")
+	}
+
+	operationTimer.Reset(operationTimeout)
+	select {
+	case v := <-proxyClientReceives:
+		t.Logf("Proxy client receives after exiting!: %v", v)
+	case <-operationTimer.C:
+		t.Fatalf("Timed out waiting for proxy client to receive message after exiting")
+	}
+
+	close(proxyClientReceives)
+	close(agentReceives)
+
+	t.Log("Waiting for all goroutines to exit")
+
+	c := make(chan struct{})
+	go func() {
+		wg.Wait()
+		c <- struct{}{}
+	}()
+
+	operationTimer.Reset(operationTimeout)
+	select {
+	case <-c:
+	case <-operationTimer.C:
+		t.Fatalf("Timed out waiting for remaining go routines to exit")
+	}
+
+	for f := range proxyClientReceives {
+		t.Fatalf("Unexpected message received by proxy client after exiting: %v", f)
+	}
+	for f := range agentReceives {
+		t.Fatalf("Unexpected message received by agent after exiting: %v", f)
 	}
 }
 
 /*
 func TestAddRemoveFrontends(t *testing.T) {
+	t.Skip()
+
 	agent1ConnID1 := new(server.ProxyClientConnection)
 	agent1ConnID2 := new(server.ProxyClientConnection)
 	agent2ConnID1 := new(server.ProxyClientConnection)
