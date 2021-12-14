@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc/metadata"
@@ -144,6 +145,10 @@ type ProxyServer struct {
 	AgentAuthenticationOptions *AgentTokenAuthenticationOptions
 
 	proxyStrategies []ProxyStrategy
+
+	nextStreamID                 int64
+	connectionIDsByStreamIDMutex sync.RWMutex
+	connectionIDsByStreamID      map[int64]map[int64]struct{}
 }
 
 // AgentTokenAuthenticationOptions contains list of parameters required for agent token based authentication
@@ -348,9 +353,10 @@ func NewProxyServer(serverID string, proxyStrategies []ProxyStrategy, serverCoun
 		BackendManagers:            bms,
 		AgentAuthenticationOptions: agentAuthenticationOptions,
 		// use the first backend-manager as the Readiness Manager
-		Readiness:          bms[0],
-		proxyStrategies:    proxyStrategies,
-		warnOnChannelLimit: warnOnChannelLimit,
+		Readiness:               bms[0],
+		proxyStrategies:         proxyStrategies,
+		warnOnChannelLimit:      warnOnChannelLimit,
+		connectionIDsByStreamID: map[int64]map[int64]struct{}{},
 	}
 }
 
@@ -379,7 +385,39 @@ func (s *ProxyServer) Proxy(stream Connection) error {
 	recvCh := make(chan *client.Packet, xfrChannelSize)
 	stopCh := make(chan error)
 
-	go s.serveRecvFrontend(stream, recvCh)
+	streamID := atomic.AddInt64(&s.nextStreamID, 1)
+
+	streamIdleTimeout := 30 * time.Second
+	streamIdleTimer := time.NewTimer(streamIdleTimeout) // idle timeout
+
+	go func() {
+		select {
+		case <-stopCh:
+			return
+		case <-streamIdleTimer.C:
+			s.connectionIDsByStreamIDMutex.Lock()
+			switch len(s.connectionIDsByStreamID[streamID]) {
+			case 0:
+				stream.Send(nil)
+			default:
+				for connID := range s.connectionIDsByStreamID[streamID] {
+					pkt := &client.Packet{
+						Type: client.PacketType_CLOSE_REQ,
+						Payload: &client.Packet_CloseRequest{
+							CloseRequest: &client.CloseRequest{
+								ConnectID: connID,
+							},
+						},
+					}
+
+					recvCh <- pkt
+				}
+			}
+			s.connectionIDsByStreamIDMutex.Unlock()
+		}
+	}()
+
+	go s.serveRecvFrontend(stream, recvCh, streamID)
 
 	defer func() {
 		klog.V(1).InfoS("Receive channel on Proxy is stopping", "userAgent", userAgent, "serverID", s.serverID)
@@ -390,6 +428,8 @@ func (s *ProxyServer) Proxy(stream Connection) error {
 	go func() {
 		for {
 			in, err := stream.Recv()
+			streamIdleTimer.Reset(streamIdleTimeout)
+
 			if err == io.EOF {
 				klog.V(1).InfoS("Stream closed on Proxy", "userAgent", userAgent, "serverID", s.serverID)
 				close(stopCh)
@@ -412,7 +452,7 @@ func (s *ProxyServer) Proxy(stream Connection) error {
 	return <-stopCh
 }
 
-func (s *ProxyServer) serveRecvFrontend(stream Sender, recvCh <-chan *client.Packet) {
+func (s *ProxyServer) serveRecvFrontend(stream Sender, recvCh <-chan *client.Packet, streamID int64) {
 	klog.V(4).Infoln("start serving frontend stream")
 
 	var firstConnID int64
@@ -469,7 +509,12 @@ func (s *ProxyServer) serveRecvFrontend(stream Sender, recvCh <-chan *client.Pac
 				// TODO: retry with other backends connecting to this agent.
 				klog.ErrorS(err, "CLOSE_REQ to Backend failed", "serverID", s.serverID, "connectionID", connID)
 			}
-			klog.V(1).Infoln("CLOSE_REQ sent to backend", "serverID", s.serverID, "connectionID", connID)
+
+			s.connectionIDsByStreamIDMutex.Lock()
+			delete(s.connectionIDsByStreamID[streamID], connID)
+			s.connectionIDsByStreamIDMutex.Unlock()
+
+			klog.V(5).Infoln("CLOSE_REQ sent to backend", "serverID", s.serverID, "connectionID", connID)
 
 		case client.PacketType_DIAL_CLS:
 			random := pkt.GetCloseDial().Random
@@ -480,6 +525,15 @@ func (s *ProxyServer) serveRecvFrontend(stream Sender, recvCh <-chan *client.Pac
 
 		case client.PacketType_DATA:
 			connID := pkt.GetData().ConnectID
+
+			s.connectionIDsByStreamIDMutex.Lock()
+			if _, ok := s.connectionIDsByStreamID[streamID]; !ok {
+				s.connectionIDsByStreamID[streamID] = map[int64]struct{}{}
+			}
+
+			s.connectionIDsByStreamID[streamID][connID] = struct{}{}
+			s.connectionIDsByStreamIDMutex.Unlock()
+
 			data := pkt.GetData().Data
 			klog.V(1).InfoS("Received data from connection", "bytes", len(data), "connectionID", connID)
 			if firstConnID == 0 {
