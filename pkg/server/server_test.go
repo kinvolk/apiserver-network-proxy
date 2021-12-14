@@ -215,8 +215,6 @@ func (c *mockStream) Send(p *client.Packet) error {
 }
 
 func (c *mockStream) SendHeader(h metadata.MD) error {
-	c.t.Logf("Sending header: %v", h)
-
 	return nil
 }
 
@@ -235,16 +233,12 @@ func Test_NewProxyServer(t *testing.T) {
 	var wg sync.WaitGroup
 
 	go func() {
-		t.Log("Agent started")
-
 		// Connect registers backend in the proxy server.
 		agentDone <- testProxyServer.Connect(&mockStream{
 			receive: agentSends,
 			t:       t,
 			send:    agentReceives,
 		})
-
-		t.Log("Agent exited")
 	}()
 
 	proxyClientSends := make(chan *client.Packet)
@@ -252,10 +246,6 @@ func Test_NewProxyServer(t *testing.T) {
 	proxyClientReceives := make(chan *client.Packet)
 
 	proxyClientsCount := 0
-
-	// Requesting proxy connection to 1.1.1.1.
-	//
-	// This request will be forwarded to the backend.
 
 	func() {
 		agentResponded := false
@@ -269,7 +259,6 @@ func Test_NewProxyServer(t *testing.T) {
 				if !agentResponded {
 					// If proxy responds with no backend error, connection proxy will be closed, so we need to start it again.
 					go func() {
-						t.Log("Proxy started")
 						proxyClientsCount += 1
 
 						wg.Add(1)
@@ -280,15 +269,13 @@ func Test_NewProxyServer(t *testing.T) {
 							send:    proxyClientReceives,
 						})
 
-						t.Log("Proxy exited")
 						wg.Done()
 					}()
-
-					t.Log("Sending dial request")
 
 					operationTimer.Reset(operationTimeout)
 
 					select {
+					// Request connection to 1.1.1.1 from proxy to simulate real connection.
 					case proxyClientSends <- &client.Packet{
 						Type: client.PacketType_DIAL_REQ,
 						Payload: &client.Packet_DialRequest{
@@ -303,15 +290,13 @@ func Test_NewProxyServer(t *testing.T) {
 					}
 				}
 
-				t.Log("Waiting for proxy server to respond")
-
+				// Wait for proxy server to respond.
 				operationTimer.Reset(operationTimeout)
 				select {
+				// If proxy server selected available backed, agent will respond with dial
+				// response with the same random value.
 				case <-agentReceives:
-					t.Log("Backend registered, responding with agent response")
-
 					operationTimer.Reset(operationTimeout)
-					// For dial request, proxy responds with dial response.
 					select {
 					case agentSends <- &client.Packet{
 						Type: client.PacketType_DIAL_RSP,
@@ -327,16 +312,13 @@ func Test_NewProxyServer(t *testing.T) {
 
 					agentResponded = true
 				case response := <-proxyClientReceives:
-					t.Log("Proxy client received response from proxy server, inspecting...")
-
 					err := response.GetDialResponse().Error
 					if err == "" {
-						t.Log("Connected to the backend!")
 						return
 					}
 
 					t.Logf("Got dial error %q, retrying", err)
-					t.Log("Terminating existing proxy stream")
+
 					// TODO: Client must send io.EOF over stream in case of no backend error?
 					// Otherwise receiving loop exits, but Recv will keep pushing data.
 					operationTimer.Reset(operationTimeout)
@@ -352,25 +334,26 @@ func Test_NewProxyServer(t *testing.T) {
 		}
 	}()
 
-	t.Log("Closing proxy client connection")
-
-	// This closes test stream.
-	proxyClientSends <- nil
+	// This closes test stream and so proxy client connection.
+	operationTimer.Reset(operationTimeout)
+	select {
+	case proxyClientSends <- nil:
+	case <-operationTimer.C:
+		t.Fatalf("Timed out closing proxy client connection")
+	}
 
 	// TODO: If no data packets is send over connection, connection ID is 0.
 	operationTimer.Reset(operationTimeout)
 	select {
-	case agentReceivedValue := <-agentReceives:
-		t.Logf("Agent received: %v", agentReceivedValue)
+	// Closing stream should send close request to agent.
+	case <-agentReceives:
 	case <-operationTimer.C:
 		t.Fatalf("Timed out waiting for agent to receive response")
 	}
 
-	t.Log("Waiting for all started proxy clients to exit")
-
+	// Wait for all started proxy clients to exit.
+	operationTimer.Reset(operationTimeout)
 	for i := 0; i < proxyClientsCount; i++ {
-		operationTimer.Reset(operationTimeout)
-
 		select {
 		case err := <-proxyClientDone:
 			if err != nil {
@@ -381,8 +364,7 @@ func Test_NewProxyServer(t *testing.T) {
 		}
 	}
 
-	t.Log("Proxy client exited")
-
+	// Close agent side of stream.
 	operationTimer.Reset(operationTimeout)
 	select {
 	case agentSends <- nil:
@@ -390,8 +372,7 @@ func Test_NewProxyServer(t *testing.T) {
 		t.Fatalf("Timed out closing agent stream")
 	}
 
-	t.Log("Waiting for agent to exit")
-
+	// Wait for agent to exit.
 	operationTimer.Reset(operationTimeout)
 	select {
 	case err := <-agentDone:
@@ -402,10 +383,10 @@ func Test_NewProxyServer(t *testing.T) {
 		t.Fatalf("Timed out waiting for agent to exit")
 	}
 
+	// Drain trailing proxy client messages.
 	operationTimer.Reset(operationTimeout)
 	select {
-	case v := <-proxyClientReceives:
-		t.Logf("Proxy client receives after exiting!: %v", v)
+	case <-proxyClientReceives:
 	case <-operationTimer.C:
 		t.Fatalf("Timed out waiting for proxy client to receive message after exiting")
 	}
@@ -413,8 +394,7 @@ func Test_NewProxyServer(t *testing.T) {
 	close(proxyClientReceives)
 	close(agentReceives)
 
-	t.Log("Waiting for all goroutines to exit")
-
+	// Wait for all goroutines to exit.
 	c := make(chan struct{})
 	go func() {
 		wg.Wait()
