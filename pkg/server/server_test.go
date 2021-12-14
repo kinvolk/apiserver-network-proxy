@@ -286,7 +286,7 @@ func Test_NewProxyServer(t *testing.T) {
 					t.Logf("Got dial error %q, retrying", err)
 
 					// TODO: Client must send io.EOF over stream in case of no backend error?
-					// Otherwise receiving loop exits, but Recv will keep pushing data.
+					// Otherwise receiving loop exits, but Recv will keep waiting for data.
 					sendWithTimeout(t, proxyClientSends, nil, "closing proxy client stream")
 				case <-operationTimer.C:
 					t.Fatalf("Timed out waiting for proxy server to respond")
