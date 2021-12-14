@@ -272,11 +272,7 @@ func Test_NewProxyServer(t *testing.T) {
 						wg.Done()
 					}()
 
-					operationTimer.Reset(operationTimeout)
-
-					select {
-					// Request connection to 1.1.1.1 from proxy to simulate real connection.
-					case proxyClientSends <- &client.Packet{
+					response := &client.Packet{
 						Type: client.PacketType_DIAL_REQ,
 						Payload: &client.Packet_DialRequest{
 							DialRequest: &client.DialRequest{
@@ -284,10 +280,10 @@ func Test_NewProxyServer(t *testing.T) {
 								Random:  1,
 							},
 						},
-					}:
-					case <-operationTimer.C:
-						t.Fatalf("Timed out sending dial request to proxy client")
 					}
+
+					// Request connection to 1.1.1.1 from proxy to simulate real connection.
+					sendWithTimeout(t, proxyClientSends, response, "sending dial request to proxy client")
 				}
 
 				// Wait for proxy server to respond.
@@ -296,19 +292,16 @@ func Test_NewProxyServer(t *testing.T) {
 				// If proxy server selected available backed, agent will respond with dial
 				// response with the same random value.
 				case <-agentReceives:
-					operationTimer.Reset(operationTimeout)
-					select {
-					case agentSends <- &client.Packet{
+					response := &client.Packet{
 						Type: client.PacketType_DIAL_RSP,
 						Payload: &client.Packet_DialResponse{
 							DialResponse: &client.DialResponse{
 								Random: 1,
 							},
 						},
-					}:
-					case <-operationTimer.C:
-						t.Fatalf("Timed out sending agent response")
 					}
+
+					sendWithTimeout(t, agentSends, response, "sending agent response")
 
 					agentResponded = true
 				case response := <-proxyClientReceives:
@@ -321,12 +314,7 @@ func Test_NewProxyServer(t *testing.T) {
 
 					// TODO: Client must send io.EOF over stream in case of no backend error?
 					// Otherwise receiving loop exits, but Recv will keep pushing data.
-					operationTimer.Reset(operationTimeout)
-					select {
-					case proxyClientSends <- nil:
-					case <-operationTimer.C:
-						t.Fatalf("Timed out closing proxy client stream")
-					}
+					sendWithTimeout(t, proxyClientSends, nil, "closing proxy client stream")
 				case <-operationTimer.C:
 					t.Fatalf("Timed out waiting for proxy server to respond")
 				}
@@ -335,84 +323,82 @@ func Test_NewProxyServer(t *testing.T) {
 	}()
 
 	// This closes test stream and so proxy client connection.
-	operationTimer.Reset(operationTimeout)
-	select {
-	case proxyClientSends <- nil:
-	case <-operationTimer.C:
-		t.Fatalf("Timed out closing proxy client connection")
-	}
+	sendWithTimeout(t, proxyClientSends, nil, "closing proxy client connection")
 
 	// TODO: If no data packets is send over connection, connection ID is 0.
-	operationTimer.Reset(operationTimeout)
-	select {
 	// Closing stream should send close request to agent.
-	case <-agentReceives:
-	case <-operationTimer.C:
-		t.Fatalf("Timed out waiting for agent to receive response")
-	}
+	readWithTimeout(t, agentReceives, "Timed out waiting for agent to receive response")
 
 	// Wait for all started proxy clients to exit.
-	operationTimer.Reset(operationTimeout)
 	for i := 0; i < proxyClientsCount; i++ {
-		select {
-		case err := <-proxyClientDone:
-			if err != nil {
-				t.Fatalf("Unexpected error from proxy: %v", err)
-			}
-		case <-operationTimer.C:
-			t.Fatalf("Timed out waiting for proxy client to exit")
-		}
+		checkErrWithTimeout(t, proxyClientDone, "Unexpected error from proxy: %v", "waiting for proxy client to exit")
 	}
 
 	// Close agent side of stream.
-	operationTimer.Reset(operationTimeout)
-	select {
-	case agentSends <- nil:
-	case <-operationTimer.C:
-		t.Fatalf("Timed out closing agent stream")
-	}
+	sendWithTimeout(t, agentSends, nil, "closing agent stream")
 
 	// Wait for agent to exit.
-	operationTimer.Reset(operationTimeout)
-	select {
-	case err := <-agentDone:
-		if err != nil {
-			t.Fatalf("Got unexpected error while connecting: %v", err)
-		}
-	case <-operationTimer.C:
-		t.Fatalf("Timed out waiting for agent to exit")
-	}
+	checkErrWithTimeout(t, agentDone, "Got unexpected error while connecting: %v", "waiting for agent to exit")
 
 	// Drain trailing proxy client messages.
-	operationTimer.Reset(operationTimeout)
-	select {
-	case <-proxyClientReceives:
-	case <-operationTimer.C:
-		t.Fatalf("Timed out waiting for proxy client to receive message after exiting")
-	}
+	readWithTimeout(t, proxyClientReceives, "waiting for proxy client to receive message after exiting")
 
 	close(proxyClientReceives)
 	close(agentReceives)
 
 	// Wait for all goroutines to exit.
-	c := make(chan struct{})
+	c := make(chan *client.Packet)
 	go func() {
 		wg.Wait()
-		c <- struct{}{}
+		c <- nil
 	}()
 
-	operationTimer.Reset(operationTimeout)
-	select {
-	case <-c:
-	case <-operationTimer.C:
-		t.Fatalf("Timed out waiting for remaining go routines to exit")
-	}
+	readWithTimeout(t, c, "waiting for remaining go routines to exit")
 
 	for f := range proxyClientReceives {
 		t.Fatalf("Unexpected message received by proxy client after exiting: %v", f)
 	}
 	for f := range agentReceives {
 		t.Fatalf("Unexpected message received by agent after exiting: %v", f)
+	}
+}
+
+func checkErrWithTimeout(t *testing.T, ch <-chan error, errorMsg string, timeoutMsg string) {
+	t.Helper()
+
+	timer := time.NewTimer(time.Second)
+
+	select {
+	case err := <-ch:
+		if err != nil {
+			t.Fatalf(errorMsg, err)
+		}
+	case <-timer.C:
+		t.Fatalf("Timed out %s", timeoutMsg)
+	}
+}
+
+func readWithTimeout(t *testing.T, ch <-chan *client.Packet, errorMsg string) {
+	t.Helper()
+
+	timer := time.NewTimer(time.Second)
+
+	select {
+	case <-ch:
+	case <-timer.C:
+		t.Fatalf("Timed out %s", errorMsg)
+	}
+}
+
+func sendWithTimeout(t *testing.T, ch chan<- *client.Packet, value *client.Packet, errorMsg string) {
+	t.Helper()
+
+	timer := time.NewTimer(time.Second)
+
+	select {
+	case ch <- value:
+	case <-timer.C:
+		t.Fatalf("Timed out %s", errorMsg)
 	}
 }
 
