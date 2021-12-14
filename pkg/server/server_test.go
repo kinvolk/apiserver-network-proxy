@@ -187,41 +187,14 @@ func TestAgentTokenAuthenticationErrorsToken(t *testing.T) {
 	}
 }
 
-type mockStream struct {
-	receive chan *client.Packet
-	t       *testing.T
-	send    chan *client.Packet
-}
-
-func (c *mockStream) Context() context.Context {
-	return metadata.NewIncomingContext(context.TODO(), metadata.MD{
-		header.AgentID:          []string{"1"},
-		header.AgentIdentifiers: []string{"ipv4=1.1.1.1"},
-	})
-}
-
-func (c *mockStream) Recv() (*client.Packet, error) {
-	if packet := <-c.receive; packet != nil {
-		return packet, nil
-	}
-
-	return nil, io.EOF
-}
-
-func (c *mockStream) Send(p *client.Packet) error {
-	c.send <- p
-
-	return nil
-}
-
-func (c *mockStream) SendHeader(h metadata.MD) error {
-	return nil
+func TestMain(m *testing.M) {
+	goleak.VerifyTestMain(m, goleak.IgnoreTopFunction("k8s.io/klog/v2.(*loggingT).flushDaemon"))
 }
 
 func Test_NewProxyServer(t *testing.T) {
-	defer goleak.VerifyNone(t, goleak.IgnoreTopFunction("k8s.io/klog/v2.(*loggingT).flushDaemon"))
+	t.Parallel()
 
-	operationTimeout := 1 * time.Second
+	operationTimeout := time.Second
 	operationTimer := time.NewTimer(operationTimeout)
 
 	testProxyServer := server.NewProxyServer("foo", []server.ProxyStrategy{server.ProxyStrategyDefault}, 1, &server.AgentTokenAuthenticationOptions{}, false)
@@ -361,6 +334,37 @@ func Test_NewProxyServer(t *testing.T) {
 	for f := range agentReceives {
 		t.Fatalf("Unexpected message received by agent after exiting: %v", f)
 	}
+}
+
+type mockStream struct {
+	receive chan *client.Packet
+	t       *testing.T
+	send    chan *client.Packet
+}
+
+func (c *mockStream) Context() context.Context {
+	return metadata.NewIncomingContext(context.TODO(), metadata.MD{
+		header.AgentID:          []string{"1"},
+		header.AgentIdentifiers: []string{"ipv4=1.1.1.1"},
+	})
+}
+
+func (c *mockStream) Recv() (*client.Packet, error) {
+	if packet := <-c.receive; packet != nil {
+		return packet, nil
+	}
+
+	return nil, io.EOF
+}
+
+func (c *mockStream) Send(p *client.Packet) error {
+	c.send <- p
+
+	return nil
+}
+
+func (c *mockStream) SendHeader(h metadata.MD) error {
+	return nil
 }
 
 func checkErrWithTimeout(t *testing.T, ch <-chan error, errorMsg string, timeoutMsg string) {
