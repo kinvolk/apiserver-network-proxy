@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc/metadata"
@@ -148,6 +149,15 @@ type ProxyServer struct {
 
 	// Kills inactive (no app payload) Proxy connections after this duration
 	grpcMaxIdleTime time.Duration
+
+	// Tracks the stream ID.
+	nextStreamID int64
+
+	// Map to track the connections per stream ID.
+	connectionIDsByStreamID map[int64]map[int64]struct{}
+
+	// Mutex to avoid race conditions while reading writing to the map.
+	connectionIDsByStreamIDMutex sync.RWMutex
 }
 
 // AgentTokenAuthenticationOptions contains list of parameters required for agent token based authentication
@@ -352,10 +362,11 @@ func NewProxyServer(serverID string, proxyStrategies []ProxyStrategy, serverCoun
 		BackendManagers:            bms,
 		AgentAuthenticationOptions: agentAuthenticationOptions,
 		// use the first backend-manager as the Readiness Manager
-		Readiness:          bms[0],
-		proxyStrategies:    proxyStrategies,
-		warnOnChannelLimit: warnOnChannelLimit,
-		grpcMaxIdleTime:    grpcMaxIdleTime,
+		Readiness:               bms[0],
+		proxyStrategies:         proxyStrategies,
+		warnOnChannelLimit:      warnOnChannelLimit,
+		grpcMaxIdleTime:         grpcMaxIdleTime,
+		connectionIDsByStreamID: map[int64]map[int64]struct{}{},
 	}
 }
 
@@ -374,7 +385,58 @@ func (s *ProxyServer) Proxy(stream client.ProxyService_ProxyServer) error {
 	recvCh := make(chan *client.Packet, xfrChannelSize)
 	stopCh := make(chan error)
 
-	go s.serveRecvFrontend(stream, recvCh)
+	// Assign a stream ID.
+	streamID := atomic.AddInt64(&s.nextStreamID, 1)
+
+	// If this param is specified, we set a timer. Otherwise, the timer
+	// channel will never receive anything, therefore never fire and act as
+	// there is no inactivity timeout for this connection.
+	streamIdleTimer := &time.Timer{}
+	if s.grpcMaxIdleTime != 0 {
+		streamIdleTimer = time.NewTimer(s.grpcMaxIdleTime)
+	}
+
+	// This goroutine closes the idle streams.
+	// We get all the connectionIDs by stream ID and if the timer fires, we send a close request
+	// to the recvCh itself. This is the same channel on which the proxy-server sends packets after
+	// receiving from the client (i.e kube-apiserver). This way we simulate the behaviour as if the
+	// kube-apiserver is sending the connection close request, hence completing the cycle of a packet.
+	// In the case of zero connectionIDs present in the map, we close the stream, becuase its been
+	// noticed that under duress certain connections, establish a connection by sending the DIAL_REQ
+	// and receiving the DIAL_RSP, but no PacketType_DATA is ever sent, hence we never get the connID by
+	// which we can close the connection. In order to mitigate that, we can take advantage of the
+	// fact that since the stream is idle and we close the stream. More details regarding the issue in
+	// https://github.com/kubernetes-sigs/apiserver-network-proxy/issues/311
+	go func() {
+		select {
+		case <-stopCh:
+			return
+		case <-streamIdleTimer.C:
+			s.connectionIDsByStreamIDMutex.Lock()
+			switch len(s.connectionIDsByStreamID[streamID]) {
+			case 0:
+				klog.V(2).InfoS("Closing stream due to inactivity", "streamID", streamID, "serverID", s.serverID)
+				stream.Send(nil)
+			default:
+				for connID := range s.connectionIDsByStreamID[streamID] {
+					pkt := &client.Packet{
+						Type: client.PacketType_CLOSE_REQ,
+						Payload: &client.Packet_CloseRequest{
+							CloseRequest: &client.CloseRequest{
+								ConnectID: connID,
+							},
+						},
+					}
+
+					klog.V(5).InfoS("Connection inactivity timeout, sending CLOSE_REQ", "serverID", s.serverID, "connectionID", connID, "streamID", streamID)
+					recvCh <- pkt
+				}
+			}
+			s.connectionIDsByStreamIDMutex.Unlock()
+		}
+	}()
+
+	go s.serveRecvFrontend(stream, recvCh, streamID)
 
 	defer func() {
 		klog.V(2).InfoS("Receive channel on Proxy is stopping", "userAgent", userAgent, "serverID", s.serverID)
@@ -385,6 +447,10 @@ func (s *ProxyServer) Proxy(stream client.ProxyService_ProxyServer) error {
 	go func() {
 		for {
 			in, err := stream.Recv()
+			// Reset the timer as there is some activity in the stream.
+			if s.grpcMaxIdleTime != 0 {
+				streamIdleTimer.Reset(s.grpcMaxIdleTime)
+			}
 			if err == io.EOF {
 				klog.V(2).InfoS("Stream closed on Proxy", "userAgent", userAgent, "serverID", s.serverID)
 				close(stopCh)
@@ -407,7 +473,7 @@ func (s *ProxyServer) Proxy(stream client.ProxyService_ProxyServer) error {
 	return <-stopCh
 }
 
-func (s *ProxyServer) serveRecvFrontend(stream client.ProxyService_ProxyServer, recvCh <-chan *client.Packet) {
+func (s *ProxyServer) serveRecvFrontend(stream client.ProxyService_ProxyServer, recvCh <-chan *client.Packet, streamID int64) {
 	klog.V(4).Infoln("start serving frontend stream")
 
 	var firstConnID int64
@@ -464,6 +530,10 @@ func (s *ProxyServer) serveRecvFrontend(stream client.ProxyService_ProxyServer, 
 				// TODO: retry with other backends connecting to this agent.
 				klog.ErrorS(err, "CLOSE_REQ to Backend failed", "serverID", s.serverID, "connectionID", connID)
 			}
+
+			s.connectionIDsByStreamIDMutex.Lock()
+			delete(s.connectionIDsByStreamID[streamID], connID)
+			s.connectionIDsByStreamIDMutex.Unlock()
 			klog.V(5).Infoln("CLOSE_REQ sent to backend", "serverID", s.serverID, "connectionID", connID)
 
 		case client.PacketType_DIAL_CLS:
@@ -475,6 +545,15 @@ func (s *ProxyServer) serveRecvFrontend(stream client.ProxyService_ProxyServer, 
 
 		case client.PacketType_DATA:
 			connID := pkt.GetData().ConnectID
+
+			// Store the connID in the map.
+			s.connectionIDsByStreamIDMutex.Lock()
+			if _, ok := s.connectionIDsByStreamID[streamID]; !ok {
+				s.connectionIDsByStreamID[streamID] = map[int64]struct{}{}
+			}
+			s.connectionIDsByStreamID[streamID][connID] = struct{}{}
+			s.connectionIDsByStreamIDMutex.Unlock()
+
 			data := pkt.GetData().Data
 			klog.V(5).InfoS("Received data from connection", "bytes", len(data), "connectionID", connID)
 			if firstConnID == 0 {
