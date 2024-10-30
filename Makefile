@@ -36,7 +36,7 @@ INSTALL_LOCATION:=$(shell go env GOPATH)/bin
 GOLANGCI_LINT_VERSION ?= 1.56.2
 GOSEC_VERSION ?= 2.13.1
 
-REGISTRY ?= gcr.io/$(shell gcloud config get-value project)
+REGISTRY ?= docker.io
 STAGING_REGISTRY := gcr.io/k8s-staging-kas-network-proxy
 
 SERVER_IMAGE_NAME ?= proxy-server

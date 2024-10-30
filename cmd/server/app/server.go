@@ -40,6 +40,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/apiserver-network-proxy/cmd/server/app/options"
@@ -96,6 +97,43 @@ type Proxy struct {
 
 type StopFunc func()
 
+func (p *Proxy) k8sClientSetup(o *options.ProxyRunOptions) (*kubernetes.Clientset, error) {
+	var k8sClient *kubernetes.Clientset
+	var config *rest.Config
+	var err error
+
+	switch o.AgentAuthMode {
+	case "token":
+		config, err = clientcmd.BuildConfigFromFlags("", o.KubeconfigPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load kubernetes client config: %v", err)
+		}
+	case "tls":
+		config = &rest.Config{
+			Host:            o.APIServerFQDN,
+			TLSClientConfig: rest.TLSClientConfig{CertFile: o.ServerCert, KeyFile: o.ServerKey, CAFile: o.ServerCaCert},
+		}
+	default:
+		return nil, fmt.Errorf("invalid agent auth mode: %s", o.AgentAuthMode)
+	}
+
+	if o.KubeconfigQPS != 0 {
+		klog.V(1).Infof("Setting k8s client QPS: %v", o.KubeconfigQPS)
+		config.QPS = o.KubeconfigQPS
+	}
+	if o.KubeconfigBurst != 0 {
+		klog.V(1).Infof("Setting k8s client Burst: %v", o.KubeconfigBurst)
+		config.Burst = o.KubeconfigBurst
+	}
+	config.ContentType = o.APIContentType
+	k8sClient, err = kubernetes.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create kubernetes clientset: %v", err)
+	}
+
+	return k8sClient, err
+}
+
 func (p *Proxy) Run(o *options.ProxyRunOptions, stopCh <-chan struct{}) error {
 	o.Print()
 	if err := o.Validate(); err != nil {
@@ -105,25 +143,30 @@ func (p *Proxy) Run(o *options.ProxyRunOptions, stopCh <-chan struct{}) error {
 	defer cancel()
 
 	var k8sClient *kubernetes.Clientset
-	if o.AgentNamespace != "" {
-		config, err := clientcmd.BuildConfigFromFlags("", o.KubeconfigPath)
-		if err != nil {
-			return fmt.Errorf("failed to load kubernetes client config: %v", err)
-		}
+	// if o.AgentNamespace != "" {
+	// 	config, err := clientcmd.BuildConfigFromFlags("", o.KubeconfigPath)
+	// 	if err != nil {
+	// 		return fmt.Errorf("failed to load kubernetes client config: %v", err)
+	// 	}
 
-		if o.KubeconfigQPS != 0 {
-			klog.V(1).Infof("Setting k8s client QPS: %v", o.KubeconfigQPS)
-			config.QPS = o.KubeconfigQPS
-		}
-		if o.KubeconfigBurst != 0 {
-			klog.V(1).Infof("Setting k8s client Burst: %v", o.KubeconfigBurst)
-			config.Burst = o.KubeconfigBurst
-		}
-		config.ContentType = o.APIContentType
-		k8sClient, err = kubernetes.NewForConfig(config)
-		if err != nil {
-			return fmt.Errorf("failed to create kubernetes clientset: %v", err)
-		}
+	// 	if o.KubeconfigQPS != 0 {
+	// 		klog.V(1).Infof("Setting k8s client QPS: %v", o.KubeconfigQPS)
+	// 		config.QPS = o.KubeconfigQPS
+	// 	}
+	// 	if o.KubeconfigBurst != 0 {
+	// 		klog.V(1).Infof("Setting k8s client Burst: %v", o.KubeconfigBurst)
+	// 		config.Burst = o.KubeconfigBurst
+	// 	}
+	// 	config.ContentType = o.APIContentType
+	// 	k8sClient, err = kubernetes.NewForConfig(config)
+	// 	if err != nil {
+	// 		return fmt.Errorf("failed to create kubernetes clientset: %v", err)
+	// 	}
+	// }
+
+	k8sClient, err := p.k8sClientSetup(o)
+	if err != nil {
+		return err
 	}
 
 	authOpt := &server.AgentTokenAuthenticationOptions{
@@ -161,6 +204,9 @@ func (p *Proxy) Run(o *options.ProxyRunOptions, stopCh <-chan struct{}) error {
 	}
 
 	if o.EnableLeaseController {
+		fmt.Println("whats happening with k8sClient: --------------------------------")
+		fmt.Println(k8sClient)
+		fmt.Println("----------------------------------------------")
 		leaseController := leases.NewController(
 			k8sClient,
 			o.ServerID,

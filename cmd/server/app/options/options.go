@@ -112,6 +112,10 @@ type ProxyRunOptions struct {
 	LeaseNamespace string
 	// Lease Labels
 	LeaseLabel string
+	// Authentication mechanism for agent
+	AgentAuthMode string
+	// APIServerFQDN
+	APIServerFQDN string
 }
 
 func (o *ProxyRunOptions) Flags() *pflag.FlagSet {
@@ -152,6 +156,7 @@ func (o *ProxyRunOptions) Flags() *pflag.FlagSet {
 	flags.BoolVar(&o.EnableLeaseController, "enable-lease-controller", o.EnableLeaseController, "Enable lease controller to publish and garbage collect proxy server leases.")
 	flags.StringVar(&o.LeaseNamespace, "lease-namespace", o.LeaseNamespace, "The namespace where lease objects are managed by the controller.")
 	flags.StringVar(&o.LeaseLabel, "lease-label", o.LeaseLabel, "The labels on which the lease objects are managed.")
+	flags.StringVar(&o.APIServerFQDN, "apiserver-fqdn", o.APIServerFQDN, "API Server FQDN.")
 	flags.Bool("warn-on-channel-limit", true, "This behavior is now thread safe and always on. This flag will be removed in a future release.")
 	flags.MarkDeprecated("warn-on-channel-limit", "This behavior is now thread safe and always on. This flag will be removed in a future release.")
 
@@ -288,9 +293,14 @@ func (o *ProxyRunOptions) Validate() error {
 		return fmt.Errorf("if --enable-contention-profiling is set, --enable-profiling must also be set")
 	}
 
+	// setting the value of AgentAuthMode as "tls", if AgentNamespace is provided then we switch to token
+	o.AgentAuthMode = "tls"
+
 	// validate agent authentication params
 	// all 4 parameters must be empty or must have value (except KubeconfigPath that might be empty)
 	if o.AgentNamespace != "" || o.AgentServiceAccount != "" || o.AuthenticationAudience != "" || o.KubeconfigPath != "" {
+		o.AgentAuthMode = "token"
+
 		if o.ClusterCaCert != "" {
 			return fmt.Errorf("ClusterCaCert can not be used when service account authentication is enabled")
 		}
