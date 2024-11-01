@@ -39,6 +39,10 @@ type ProxyRunOptions struct {
 	ClusterCert   string
 	ClusterKey    string
 	ClusterCaCert string
+	// Client certificate setup
+	ClientCert   string
+	ClientKey    string
+	ClientCaCert string
 	// Flag to switch between gRPC and HTTP Connect
 	Mode string
 	// Location for use by the "unix" network. Setting enables UDS for server connections.
@@ -126,6 +130,9 @@ func (o *ProxyRunOptions) Flags() *pflag.FlagSet {
 	flags.StringVar(&o.ClusterCert, "cluster-cert", o.ClusterCert, "If non-empty secure communication with this cert.")
 	flags.StringVar(&o.ClusterKey, "cluster-key", o.ClusterKey, "If non-empty secure communication with this key.")
 	flags.StringVar(&o.ClusterCaCert, "cluster-ca-cert", o.ClusterCaCert, "If non-empty the CA we use to validate Agent clients.")
+	flags.StringVar(&o.ClientCert, "client-cert", o.ClientCert, "If non-empty secure communication with this cert.")
+	flags.StringVar(&o.ClientKey, "client-key", o.ClientKey, "If non-empty secure communication with this key.")
+	flags.StringVar(&o.ClientCaCert, "client-ca-cert", o.ClientCaCert, "If non-empty the CA we use to validate Agent clients.")
 	flags.StringVar(&o.Mode, "mode", o.Mode, "mode can be either 'grpc' or 'http-connect'.")
 	flags.StringVar(&o.UdsName, "uds-name", o.UdsName, "uds-name should be empty for TCP traffic. For UDS set to its name.")
 	flags.BoolVar(&o.DeleteUDSFile, "delete-existing-uds-file", o.DeleteUDSFile, "If true and if file UdsName already exists, delete the file before listen on that UDS file. Default is true.")

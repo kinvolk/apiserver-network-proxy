@@ -111,7 +111,7 @@ func (p *Proxy) k8sClientSetup(o *options.ProxyRunOptions) (*kubernetes.Clientse
 	case "tls":
 		config = &rest.Config{
 			Host:            o.APIServerFQDN,
-			TLSClientConfig: rest.TLSClientConfig{CertFile: o.ServerCert, KeyFile: o.ServerKey, CAFile: o.ServerCaCert},
+			TLSClientConfig: rest.TLSClientConfig{CertFile: o.ClientCert, KeyFile: o.ClientKey, CAFile: o.ClientCaCert},
 		}
 	default:
 		return nil, fmt.Errorf("invalid agent auth mode: %s", o.AgentAuthMode)
