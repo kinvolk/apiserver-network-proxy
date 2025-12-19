@@ -114,6 +114,8 @@ type ProxyRunOptions struct {
 	LeaseLabel string
 	// Needs kubernetes client
 	NeedsKubernetesClient bool
+	// Graceful shutdown timeout duration
+	GracefulShutdownTimeout time.Duration
 }
 
 func (o *ProxyRunOptions) Flags() *pflag.FlagSet {
@@ -154,6 +156,7 @@ func (o *ProxyRunOptions) Flags() *pflag.FlagSet {
 	flags.BoolVar(&o.EnableLeaseController, "enable-lease-controller", o.EnableLeaseController, "Enable lease controller to publish and garbage collect proxy server leases.")
 	flags.StringVar(&o.LeaseNamespace, "lease-namespace", o.LeaseNamespace, "The namespace where lease objects are managed by the controller.")
 	flags.StringVar(&o.LeaseLabel, "lease-label", o.LeaseLabel, "The labels on which the lease objects are managed.")
+	flags.DurationVar(&o.GracefulShutdownTimeout, "graceful-shutdown-timeout", o.GracefulShutdownTimeout, "Timeout duration for graceful shutdown of the server. The server will wait for active connections to close before forcefully terminating. Set to 0 to disable graceful shutdown (default: 0).")
 	flags.Bool("warn-on-channel-limit", true, "This behavior is now thread safe and always on. This flag will be removed in a future release.")
 	flags.MarkDeprecated("warn-on-channel-limit", "This behavior is now thread safe and always on. This flag will be removed in a future release.")
 
@@ -197,6 +200,7 @@ func (o *ProxyRunOptions) Print() {
 	klog.V(1).Infof("LeaseLabel set to %s.\n", o.LeaseLabel)
 	klog.V(1).Infof("CipherSuites set to %q.\n", o.CipherSuites)
 	klog.V(1).Infof("XfrChannelSize set to %d.\n", o.XfrChannelSize)
+	klog.V(1).Infof("GracefulShutdownTimeout set to %v.\n", o.GracefulShutdownTimeout)
 }
 
 func (o *ProxyRunOptions) Validate() error {
@@ -338,6 +342,11 @@ func (o *ProxyRunOptions) Validate() error {
 		}
 	}
 
+	// Validate graceful shutdown timeout
+	if o.GracefulShutdownTimeout < 0 {
+		return fmt.Errorf("graceful-shutdown-timeout must be >= 0, got %v", o.GracefulShutdownTimeout)
+	}
+
 	o.NeedsKubernetesClient = usingServiceAccountAuth || o.EnableLeaseController
 
 	return nil
@@ -381,6 +390,7 @@ func NewProxyRunOptions() *ProxyRunOptions {
 		EnableLeaseController:     false,
 		LeaseNamespace:            "kube-system",
 		LeaseLabel:                "k8s-app=konnectivity-server",
+		GracefulShutdownTimeout:   0,
 	}
 	return &o
 }
