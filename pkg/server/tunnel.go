@@ -185,6 +185,13 @@ func (t *Tunnel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err = backend.Send(packet); err != nil {
 			klog.V(2).InfoS("failed to send close request packet", "host", r.Host, "agentID", connection.agentID, "connectionID", connection.connectID)
 		}
+
+		// Remove from established connections immediately.
+		// We don't wait for CLOSE_RSP since the HTTP tunnel is already closing.
+		// This prevents memory leaks when agents are slow to respond or CLOSE_RSP is lost.
+		if removed := t.Server.removeEstablished(connection.agentID, connection.connectID); removed != nil {
+			klog.V(3).InfoS("Removed established connection on tunnel close", "host", r.Host, "agentID", connection.agentID, "connectionID", connection.connectID)
+		}
 		// The top-level defer handles conn.Close()
 	}()
 
