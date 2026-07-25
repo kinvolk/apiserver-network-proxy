@@ -31,6 +31,12 @@ enum PacketType {
   DATA = 4;
   DIAL_CLS = 5;
   DRAIN = 6;
+  WINDOW_UPDATE = 7;
+}
+
+enum FlowControlFeature {
+  FLOW_CONTROL_FEATURE_UNSPECIFIED = 0;
+  AGENT_TO_SERVER_BYTE_WINDOW_V1 = 1;
 }
 
 message Packet {
@@ -44,6 +50,7 @@ message Packet {
     CloseResponse closeResponse = 6;
     CloseDial closeDial = 7;
     Drain drain = 8;
+    WindowUpdate window_update = 9;
   }
 }
 
@@ -56,6 +63,8 @@ message DialRequest {
 
     // random id for client, maybe should be longer
     int64 random = 3;
+
+    repeated FlowControlFeature offered_flow_control_features = 4;
 }
 
 message DialResponse {
@@ -67,6 +76,8 @@ message DialResponse {
 
     // random copied from DialRequest
     int64 random = 3;
+
+    repeated FlowControlFeature accepted_flow_control_features = 4;
 }
 
 message CloseRequest {
@@ -101,4 +112,9 @@ message Data {
 
     // stream data
     bytes data = 3;
+}
+
+message WindowUpdate {
+    int64 connect_id = 1;
+    uint64 max_data_offset = 2;
 }
