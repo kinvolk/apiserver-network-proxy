@@ -17,10 +17,13 @@ limitations under the License.
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"io"
+	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -454,5 +457,265 @@ func TestHTTPConnectWriterPreservesBytesAcrossPartialWrites(t *testing.T) {
 	}
 	if got := zeroWriter.calls.Load(); got != 1 {
 		t.Fatalf("zero-progress writer calls = %d, want 1", got)
+	}
+}
+
+func TestHTTPConnectInitialResponseFailures(t *testing.T) {
+	t.Run("successful dial response", func(t *testing.T) {
+		const (
+			agentID   = "response-agent"
+			connectID = int64(101)
+		)
+		server := newWriterTestServer()
+		backend, stream := newWriterTestBackend(context.Background(), agentID)
+		writeErr := errors.New("response write failed")
+		httpWriter := newWriterTestGateFailHTTP(writeErr)
+		connected := make(chan struct{})
+		var closeCalls atomic.Int32
+		connection := &ProxyClientConnection{
+			Mode:                ModeHTTPConnect,
+			HTTP:                httpWriter,
+			CloseHTTP:           func() error { closeCalls.Add(1); return nil },
+			closed:              make(chan struct{}),
+			connected:           connected,
+			httpInitialResponse: []byte(httpConnectSuccessResponse),
+			agentID:             agentID,
+			connectID:           connectID,
+			backend:             backend,
+		}
+		server.addEstablished(agentID, connectID, connection)
+		writer, attached := connection.configuredHTTPWriter(server, true)
+		if !attached {
+			t.Fatal("successful response writer was not attached")
+		}
+		writer.start()
+		select {
+		case <-httpWriter.started:
+		case <-time.After(writerTestSafetyTimeout):
+			t.Fatal("successful response write did not start")
+		}
+		httpWriter.unblock()
+		writerTestEventually(t, "failed response cleanup", func() bool {
+			return closeCalls.Load() == 1 && stream.count(client.PacketType_CLOSE_REQ) == 1
+		})
+		select {
+		case <-connected:
+			t.Fatal("connected was signaled after the successful response write failed")
+		default:
+		}
+		if got, err := server.getFrontend(agentID, connectID); err != nil || got != connection {
+			t.Fatalf("failed response terminal entry = %p, %v; want retained %p", got, err, connection)
+		}
+		if writer.beginGracefulClose() != httpConnectCloseAlreadyForced {
+			t.Fatal("backend acknowledgement did not observe the forced response failure")
+		}
+		server.removeEstablishedIf(agentID, connectID, connection)
+	})
+
+	t.Run("failed dial response with zero connection ID", func(t *testing.T) {
+		const agentID = "failed-dial-agent"
+		server := newWriterTestServer()
+		backend, stream := newWriterTestBackend(context.Background(), agentID)
+		replacement := &ProxyClientConnection{Mode: ModeHTTPConnect, agentID: agentID}
+		server.addEstablished(agentID, 0, replacement)
+
+		writeErr := errors.New("error response write failed")
+		httpWriter := newWriterTestGateFailHTTP(writeErr)
+		var closeCalls atomic.Int32
+		connected := make(chan struct{})
+		failedDial := &ProxyClientConnection{
+			Mode:      ModeHTTPConnect,
+			HTTP:      httpWriter,
+			CloseHTTP: func() error { closeCalls.Add(1); return nil },
+			closed:    make(chan struct{}),
+			connected: connected,
+			agentID:   agentID,
+			backend:   backend,
+		}
+		writer, attached := failedDial.attachHTTPWriter(server, serializeHTTPConnectDialError("dial failed"), false)
+		if !attached {
+			t.Fatal("failed-dial writer was not attached")
+		}
+		writer.start()
+		select {
+		case <-httpWriter.started:
+		case <-time.After(writerTestSafetyTimeout):
+			t.Fatal("failed-dial error response write did not start")
+		}
+		writer.beginGracefulClose()
+		httpWriter.unblock()
+		writerTestEventually(t, "failed-dial response cleanup", func() bool {
+			return closeCalls.Load() == 1
+		})
+		select {
+		case <-connected:
+			t.Fatal("failed dial signaled connected")
+		default:
+		}
+		failedDial.sendBackendCloseRequest(server, "test completion")
+		if got := stream.count(client.PacketType_CLOSE_REQ); got != 0 {
+			t.Fatalf("failed dial sent %d CLOSE_REQ packets with connection ID zero", got)
+		}
+		got, err := server.getFrontend(agentID, 0)
+		if err != nil || got != replacement {
+			t.Fatalf("zero-ID replacement = %p, %v; want %p", got, err, replacement)
+		}
+
+		serialized := serializeHTTPConnectDialError(strings.Repeat("x", maxHTTPConnectErrorBodyBytes+512))
+		response, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(serialized)), nil)
+		if err != nil {
+			t.Fatalf("parse serialized error response: %v", err)
+		}
+		body, err := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		if err != nil {
+			t.Fatalf("read serialized error body: %v", err)
+		}
+		if len(body) != maxHTTPConnectErrorBodyBytes {
+			t.Fatalf("error response body length = %d, want %d", len(body), maxHTTPConnectErrorBodyBytes)
+		}
+		if !bytes.HasSuffix(body, []byte(httpConnectTruncationMarker)) {
+			t.Fatalf("truncated error body does not end with marker: %q", body[len(body)-64:])
+		}
+	})
+}
+
+func TestHTTPConnectDeadBackendSendGuards(t *testing.T) {
+	t.Run("frontend cleanup outlives backend shutdown", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		server := newWriterTestServer()
+		backend, stream := newWriterTestBackend(ctx, "dead-agent")
+		closeStarted := make(chan struct{})
+		closeRelease := make(chan struct{})
+		closeReturned := make(chan struct{})
+		connection := &ProxyClientConnection{
+			Mode:      ModeHTTPConnect,
+			HTTP:      newWriterTestImmediateHTTP(),
+			closed:    make(chan struct{}),
+			agentID:   "dead-agent",
+			connectID: 201,
+			backend:   backend,
+			CloseHTTP: func() error {
+				close(closeStarted)
+				<-closeRelease
+				close(closeReturned)
+				return nil
+			},
+		}
+		writer, _ := connection.attachHTTPWriter(server, nil, false)
+		writer.start()
+		connection.abortHTTP(server, httpConnectAbortFrontendClose)
+		select {
+		case <-closeStarted:
+		case <-time.After(writerTestSafetyTimeout):
+			t.Fatal("frontend cleanup did not enter CloseHTTP")
+		}
+		connection.suppressBackendCloseRequest()
+		cancel()
+		close(closeRelease)
+		select {
+		case <-closeReturned:
+		case <-time.After(writerTestSafetyTimeout):
+			t.Fatal("frontend CloseHTTP did not return")
+		}
+		// Settle the once guard synchronously if the cleanup goroutine has not yet
+		// reached it. Either caller must observe suppression.
+		connection.sendBackendCloseRequest(server, "backend shutdown")
+		if got := stream.count(client.PacketType_CLOSE_REQ); got != 0 {
+			t.Fatalf("dead backend received %d CLOSE_REQ packets", got)
+		}
+	})
+
+	t.Run("nonzero pre-publication ID with canceled context", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		server := newWriterTestServer()
+		backend, stream := newWriterTestBackend(ctx, "canceled-agent")
+		connection := &ProxyClientConnection{
+			Mode:      ModeHTTPConnect,
+			agentID:   "canceled-agent",
+			connectID: 202,
+			backend:   backend,
+		}
+		connection.sendBackendCloseRequest(server, "setup race")
+		if got := stream.count(client.PacketType_CLOSE_REQ); got != 0 {
+			t.Fatalf("canceled pre-publication backend received %d CLOSE_REQ packets", got)
+		}
+	})
+}
+
+func TestHTTPConnectTerminalSideEffectsConvergeExactlyOnce(t *testing.T) {
+	const iterations = 100
+	for i := 0; i < iterations; i++ {
+		server := newWriterTestServer()
+		backend, stream := newWriterTestBackend(context.Background(), "terminal-agent")
+		var closeCalls atomic.Int32
+		connection := &ProxyClientConnection{
+			Mode:      ModeHTTPConnect,
+			HTTP:      newWriterTestImmediateHTTP(),
+			CloseHTTP: func() error { closeCalls.Add(1); return nil },
+			closed:    make(chan struct{}),
+			agentID:   "terminal-agent",
+			connectID: int64(300 + i),
+			backend:   backend,
+		}
+		server.addEstablished(connection.agentID, connection.connectID, connection)
+		writer, _ := connection.attachHTTPWriter(server, nil, false)
+		writer.start()
+		if !writer.handoffData([]byte("in flight")) {
+			t.Fatal("initial DATA handoff was rejected")
+		}
+
+		start := make(chan struct{})
+		result := make(chan httpConnectCloseDisposition, 1)
+		var workers sync.WaitGroup
+		workers.Add(4)
+		go func() {
+			defer workers.Done()
+			<-start
+			result <- writer.beginGracefulClose()
+		}()
+		go func() {
+			defer workers.Done()
+			<-start
+			writer.abort(httpConnectAbortWriteFailure)
+		}()
+		go func() {
+			defer workers.Done()
+			<-start
+			connection.abortHTTP(server, httpConnectAbortFrontendClose)
+		}()
+		go func() {
+			defer workers.Done()
+			<-start
+			writer.handoffData([]byte("racing DATA"))
+		}()
+		close(start)
+		workers.Wait()
+		// Mirror CLOSE_RSP routing: if forced cleanup won first, the response
+		// path owns removal of the terminal map entry.
+		if <-result == httpConnectCloseAlreadyForced {
+			server.removeEstablishedIf(connection.agentID, connection.connectID, connection)
+		}
+
+		writerTestEventually(t, "converged terminal side effects", func() bool {
+			return closeCalls.Load() == 1 && stream.count(client.PacketType_CLOSE_REQ) == 1
+		})
+		// With convergence observed, replay every terminal API to prove that none
+		// can duplicate a side effect or resurrect map state.
+		connection.abortHTTP(server, httpConnectAbortFrontendClose)
+		writer.abort(httpConnectAbortWriteFailure)
+		_ = connection.closeHTTP()
+		connection.sendBackendCloseRequest(server, "duplicate terminal call")
+		if got := closeCalls.Load(); got != 1 {
+			t.Fatalf("CloseHTTP calls = %d, want 1", got)
+		}
+		if got := stream.count(client.PacketType_CLOSE_REQ); got != 1 {
+			t.Fatalf("connection-owned CLOSE_REQ count = %d, want 1", got)
+		}
+		if _, err := server.getFrontend(connection.agentID, connection.connectID); err == nil {
+			t.Fatal("terminal connection remained or was resurrected in established state")
+		}
 	}
 }
