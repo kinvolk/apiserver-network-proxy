@@ -18,16 +18,20 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"go.uber.org/mock/gomock"
 
 	client "sigs.k8s.io/apiserver-network-proxy/konnectivity-client/proto/client"
 	"sigs.k8s.io/apiserver-network-proxy/pkg/server/proxystrategies"
@@ -580,5 +584,636 @@ func TestOneOutstandingHTTPDataPacketDoesNotDelayOtherConnectionData(t *testing.
 		case <-time.After(holTestSafetyTimeout):
 			t.Fatal("connection B did not receive DATA even after connection A was released")
 		}
+	}
+}
+
+// TestTemporarilySlowHTTPFrontendRecovers targets the risk that isolation turns
+// a temporary socket slowdown into an unnecessary connection reset.
+//
+// The test:
+//  1. Registers established connections A and B on the same agent stream.
+//  2. Blocks A's first DATA write.
+//  3. Delivers DATA to B and requires B to progress while A remains blocked.
+//  4. Requires A to remain established and open during the temporary slowdown.
+//  5. Makes A writable, sends another payload, and requires both payloads in
+//     byte-stream order.
+//  6. Delivers normal CLOSE_RSP and requires close only after A's bytes drain.
+//
+// This preserves temporary-stall recovery and byte ordering without requiring
+// response DATA to be buffered while the legacy connection has no flow-control
+// credit contract.
+func TestTemporarilySlowHTTPFrontendRecovers(t *testing.T) {
+	const (
+		agentID    = "agent-1"
+		connectIDA = int64(1001)
+		connectIDB = int64(1002)
+		payloadB   = "response for healthy connection B"
+	)
+	payloadsA := [][]byte{[]byte("first response for A"), []byte("second response for A")}
+	wantStreamA := bytes.Join(payloadsA, nil)
+
+	proxyServer := NewProxyServer(
+		"",
+		[]proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault},
+		1,
+		nil,
+		2,
+	)
+	backend := &Backend{id: agentID}
+
+	frontendA := newByteStreamHTTPReadWriter()
+	connectionA := &ProxyClientConnection{
+		Mode:      ModeHTTPConnect,
+		HTTP:      frontendA,
+		CloseHTTP: frontendA.close,
+		connected: make(chan struct{}),
+		connectID: connectIDA,
+		agentID:   agentID,
+		backend:   backend,
+	}
+	proxyServer.addEstablished(agentID, connectIDA, connectionA)
+
+	frontendB := newRecordingHTTPReadWriter()
+	connectionB := &ProxyClientConnection{
+		Mode:      ModeHTTPConnect,
+		HTTP:      frontendB,
+		CloseHTTP: func() error { return nil },
+		connected: make(chan struct{}),
+		connectID: connectIDB,
+		agentID:   agentID,
+		backend:   backend,
+	}
+	proxyServer.addEstablished(agentID, connectIDB, connectionB)
+
+	recvCh := make(chan *client.Packet, 2)
+	consumerDone := make(chan struct{})
+	go func() {
+		defer close(consumerDone)
+		proxyServer.serveRecvBackend(backend, agentID, recvCh)
+	}()
+
+	var closeRecvOnce sync.Once
+	closeRecv := func() { closeRecvOnce.Do(func() { close(recvCh) }) }
+	t.Cleanup(func() {
+		frontendA.release()
+		closeRecv()
+		select {
+		case <-consumerDone:
+		case <-time.After(holTestSafetyTimeout):
+			t.Errorf("serveRecvBackend did not exit during cleanup")
+		}
+	})
+
+	recvCh <- dataPkt(connectIDA, payloadsA[0])
+	select {
+	case <-frontendA.firstWriteStarted:
+	case <-time.After(holTestSafetyTimeout):
+		t.Fatal("connection A did not enter the blocking HTTP Write")
+	}
+
+	recvCh <- dataPkt(connectIDB, []byte(payloadB))
+
+	select {
+	case got := <-frontendB.writes:
+		if string(got) != payloadB {
+			t.Fatalf("connection B received payload %q, want %q", got, payloadB)
+		}
+	case <-time.After(holTestSafetyTimeout):
+		// Release A only after B's required progress timed out. If B then
+		// progresses, the failure is specifically the shared-consumer HOL stall.
+		frontendA.release()
+		select {
+		case got := <-frontendB.writes:
+			if string(got) != payloadB {
+				t.Fatalf("connection B received payload %q after A recovered, want %q", got, payloadB)
+			}
+			t.Fatal("connection B received DATA only after connection A recovered")
+		case <-time.After(holTestSafetyTimeout):
+			t.Fatal("connection B did not receive DATA even after connection A recovered")
+		}
+	}
+
+	if _, err := proxyServer.getFrontend(agentID, connectIDA); err != nil {
+		t.Fatalf("connection A was removed while temporarily slow: %v", err)
+	}
+	_, _, closedBeforeRecovery, _ := frontendA.snapshot()
+	if closedBeforeRecovery {
+		t.Fatal("connection A was closed instead of isolated while temporarily slow")
+	}
+
+	frontendA.release()
+	deadline := time.NewTimer(holTestSafetyTimeout)
+	defer deadline.Stop()
+	for {
+		gotStream, _, _, _ := frontendA.snapshot()
+		if len(gotStream) >= len(payloadsA[0]) {
+			break
+		}
+		select {
+		case <-frontendA.streamUpdated:
+		case <-deadline.C:
+			t.Fatalf("connection A received %d bytes after recovery, want at least %d", len(gotStream), len(payloadsA[0]))
+		}
+	}
+
+	recvCh <- dataPkt(connectIDA, payloadsA[1])
+	for {
+		gotStream, _, _, _ := frontendA.snapshot()
+		if len(gotStream) >= len(wantStreamA) {
+			break
+		}
+		select {
+		case <-frontendA.streamUpdated:
+		case <-deadline.C:
+			t.Fatalf("connection A received %d bytes after recovery, want %d", len(gotStream), len(wantStreamA))
+		}
+	}
+
+	if _, err := proxyServer.getFrontend(agentID, connectIDA); err != nil {
+		t.Fatalf("connection A was removed during recovery: %v", err)
+	}
+	gotStreamA, _, closedAfterRecovery, _ := frontendA.snapshot()
+	if closedAfterRecovery {
+		t.Fatal("connection A was closed after recovering socket progress")
+	}
+	if !bytes.Equal(gotStreamA, wantStreamA) {
+		t.Fatalf("connection A byte stream after recovery = %q, want %q", gotStreamA, wantStreamA)
+	}
+
+	// Normal backend close is the terminal barrier: it must occur only after A's
+	// accepted bytes have drained and must remove A from established state.
+	recvCh <- &client.Packet{
+		Type: client.PacketType_CLOSE_RSP,
+		Payload: &client.Packet_CloseResponse{
+			CloseResponse: &client.CloseResponse{ConnectID: connectIDA},
+		},
+	}
+	select {
+	case <-frontendA.closeObserved:
+	case <-time.After(holTestSafetyTimeout):
+		t.Fatal("connection A did not close normally after recovery")
+	}
+	gotStreamA, violations, closed, inFlight := frontendA.snapshot()
+	if len(violations) > 0 {
+		t.Fatalf("connection A socket operations were not serialized through close: %v", violations)
+	}
+	if !closed {
+		t.Fatal("connection A did not reach a terminal closed state")
+	}
+	if inFlight != 0 {
+		t.Fatalf("connection A closed with %d socket operations still in flight", inFlight)
+	}
+	if !bytes.Equal(gotStreamA, wantStreamA) {
+		t.Fatalf("connection A final byte stream = %q, want %q", gotStreamA, wantStreamA)
+	}
+	if _, err := proxyServer.getFrontend(agentID, connectIDA); err == nil {
+		t.Fatal("connection A remained established after normal close")
+	}
+
+	closeRecv()
+	select {
+	case <-consumerDone:
+	case <-time.After(holTestSafetyTimeout):
+		t.Fatal("serveRecvBackend did not exit after recovery test")
+	}
+}
+
+// TestBackendShutdownUnblocksSlowHTTPFrontend targets cleanup after the agent
+// stream ends while an HTTP-CONNECT frontend socket Write is blocked.
+// ProxyServer.Connect closes recvCh when the agent stream terminates.
+//
+// The test:
+//  1. Registers established HTTP-CONNECT connection A.
+//  2. Blocks A inside its frontend socket Write.
+//  3. Closes recvCh, representing agent-stream termination.
+//  4. Does not release the write on the success path.
+//  5. Requires production cleanup to call CloseHTTP, unblock the pending Write
+//     with io.ErrClosedPipe, remove A from established state, and exit
+//     serveRecvBackend.
+//
+// The required outcome is independent of any writer goroutine, queue, or
+// cancellation implementation.
+func TestBackendShutdownUnblocksSlowHTTPFrontend(t *testing.T) {
+	const (
+		agentID   = "agent-1"
+		connectID = int64(1001)
+	)
+
+	proxyServer := NewProxyServer(
+		"",
+		[]proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault},
+		1,
+		nil,
+		1,
+	)
+	backend := &Backend{id: agentID}
+	frontend := newCloseUnblocksHTTPReadWriter()
+	connection := &ProxyClientConnection{
+		Mode:      ModeHTTPConnect,
+		HTTP:      frontend,
+		CloseHTTP: frontend.close,
+		connected: make(chan struct{}),
+		connectID: connectID,
+		agentID:   agentID,
+		backend:   backend,
+	}
+	proxyServer.addEstablished(agentID, connectID, connection)
+
+	recvCh := make(chan *client.Packet)
+	consumerDone := make(chan struct{})
+	go func() {
+		defer close(consumerDone)
+		proxyServer.serveRecvBackend(backend, agentID, recvCh)
+	}()
+
+	var closeRecvOnce sync.Once
+	closeRecv := func() { closeRecvOnce.Do(func() { close(recvCh) }) }
+	t.Cleanup(func() {
+		// A release here is failure cleanup only. The success path must be
+		// released by production calling CloseHTTP after backend shutdown.
+		frontend.release()
+		closeRecv()
+		select {
+		case <-frontend.writeDone:
+		case <-time.After(holTestSafetyTimeout):
+			t.Errorf("blocked frontend Write did not exit during cleanup")
+		}
+		select {
+		case <-consumerDone:
+		case <-time.After(holTestSafetyTimeout):
+			t.Errorf("serveRecvBackend did not exit during cleanup")
+		}
+	})
+
+	recvCh <- dataPkt(connectID, []byte("response blocked on frontend socket"))
+	select {
+	case <-frontend.writeStarted:
+	case <-time.After(holTestSafetyTimeout):
+		t.Fatal("frontend DATA did not enter the blocking HTTP Write")
+	}
+
+	// Closing recvCh models readBackendToChannel ending when the agent stream is
+	// lost. No test-side release follows: backend cleanup must close the frontend
+	// and thereby unblock its Write.
+	closeRecv()
+	select {
+	case <-frontend.closeObserved:
+	case <-time.After(holTestSafetyTimeout):
+		frontend.release()
+		select {
+		case <-frontend.closeObserved:
+			t.Fatal("backend shutdown closed the frontend only after its blocked Write was released by the test")
+		case <-time.After(holTestSafetyTimeout):
+			t.Fatal("backend shutdown did not close the blocked HTTP frontend")
+		}
+	}
+
+	select {
+	case <-frontend.writeDone:
+	case <-time.After(holTestSafetyTimeout):
+		t.Fatal("closing the frontend did not unblock its pending Write")
+	}
+	select {
+	case <-consumerDone:
+	case <-time.After(holTestSafetyTimeout):
+		t.Fatal("serveRecvBackend did not exit after backend shutdown")
+	}
+
+	closed, writeErr := frontend.snapshot()
+	if !closed {
+		t.Fatal("frontend did not reach a terminal closed state")
+	}
+	if !errors.Is(writeErr, io.ErrClosedPipe) {
+		t.Fatalf("blocked frontend Write error = %v, want %v", writeErr, io.ErrClosedPipe)
+	}
+	if _, err := proxyServer.getFrontend(agentID, connectID); err == nil {
+		t.Fatal("connection remained established after backend shutdown")
+	}
+}
+
+// TestPerConnectionDataOrdering targets reordering, omission, duplication, and
+// close overtaking within one isolated HTTP-CONNECT connection.
+//
+// The test:
+//  1. Registers one established connection and blocks its first socket Write.
+//  2. Delivers three more DATA packets followed by CLOSE_RSP.
+//  3. Releases the first Write.
+//  4. Requires the concatenated DATA byte stream exactly once and in source
+//     order, followed by terminal close with no socket operation in flight.
+//
+// DATA packet boundaries need not map one-to-one to socket Write calls; the
+// observable contract is the byte stream and close ordering.
+func TestPerConnectionDataOrdering(t *testing.T) {
+	const (
+		agentID   = "agent-1"
+		connectID = int64(1001)
+	)
+	payloads := [][]byte{[]byte("first"), []byte("second"), []byte("third"), []byte("fourth")}
+	wantStream := bytes.Join(payloads, nil)
+
+	proxyServer := NewProxyServer(
+		"",
+		[]proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault},
+		1,
+		nil,
+		len(payloads),
+	)
+	backend := &Backend{id: agentID}
+
+	frontendHTTP := newByteStreamHTTPReadWriter()
+	connection := &ProxyClientConnection{
+		Mode:      ModeHTTPConnect,
+		HTTP:      frontendHTTP,
+		CloseHTTP: frontendHTTP.close,
+		connected: make(chan struct{}),
+		connectID: connectID,
+		agentID:   agentID,
+		backend:   backend,
+	}
+	proxyServer.addEstablished(agentID, connectID, connection)
+
+	// Once the first DATA is dequeued, the channel has exactly enough capacity
+	// for the remaining DATA packets and the terminal CLOSE_RSP. Test-side sends
+	// therefore cannot become the source of the stall.
+	recvCh := make(chan *client.Packet, len(payloads))
+	consumerDone := make(chan struct{})
+	go func() {
+		defer close(consumerDone)
+		proxyServer.serveRecvBackend(backend, agentID, recvCh)
+	}()
+
+	t.Cleanup(func() {
+		frontendHTTP.release()
+		close(recvCh)
+		select {
+		case <-consumerDone:
+		case <-time.After(holTestSafetyTimeout):
+			t.Errorf("serveRecvBackend did not exit during test cleanup")
+		}
+	})
+
+	recvCh <- dataPkt(connectID, payloads[0])
+	select {
+	case <-frontendHTTP.firstWriteStarted:
+	case <-time.After(holTestSafetyTimeout):
+		t.Fatal("first DATA did not enter the blocking HTTP Write")
+	}
+
+	for _, payload := range payloads[1:] {
+		recvCh <- dataPkt(connectID, payload)
+	}
+	recvCh <- &client.Packet{
+		Type: client.PacketType_CLOSE_RSP,
+		Payload: &client.Packet_CloseResponse{
+			CloseResponse: &client.CloseResponse{ConnectID: connectID},
+		},
+	}
+
+	frontendHTTP.release()
+	select {
+	case <-frontendHTTP.closeObserved:
+	case <-time.After(holTestSafetyTimeout):
+		t.Fatal("timed out waiting for frontend close after ordered DATA")
+	}
+
+	gotStream, violations, closed, inFlight := frontendHTTP.snapshot()
+	if len(violations) > 0 {
+		t.Fatalf("frontend socket operations were not serialized: %v", violations)
+	}
+	if inFlight != 0 {
+		t.Fatalf("frontend close was observed with %d socket operations still in flight", inFlight)
+	}
+	if !closed {
+		t.Fatal("frontend did not observe the terminal close")
+	}
+	if !bytes.Equal(gotStream, wantStream) {
+		t.Fatalf("frontend byte stream = %q, want %q", gotStream, wantStream)
+	}
+}
+
+// TestHTTPConnectResponsePrecedesTunnelData targets ordering at the boundary
+// between Tunnel establishment and backend DATA delivery.
+//
+// The test:
+//  1. Starts a real Tunnel.ServeHTTP path with a hijacked test connection.
+//  2. Completes DIAL_REQ/DIAL_RSP and blocks the successful HTTP 200 Write.
+//  3. Delivers backend DATA while the response remains blocked.
+//  4. Releases the HTTP response, waits for DATA handoff, and completes
+//     CLOSE_RSP/CLOSE_REQ shutdown.
+//  5. Requires the client-visible bytes to be the complete HTTP 200 response
+//     followed by the exact tunneled DATA.
+//
+// Only wire order is asserted; no dispatch or buffering design is required.
+func TestHTTPConnectResponsePrecedesTunnelData(t *testing.T) {
+	const (
+		agentID   = "agent-1"
+		connectID = int64(1001)
+		target    = "istiod-stable.istio-system.svc:443"
+	)
+	connectResponse := []byte("HTTP/1.1 200 Connection Established\r\n\r\n")
+	payload := []byte("tunneled response bytes")
+	wantStream := append(append([]byte(nil), connectResponse...), payload...)
+
+	ctrl := gomock.NewController(t)
+	backendConn := mockAgentConn(ctrl, agentID, []string{})
+	dialRequests := make(chan *client.Packet, 1)
+	closeRequests := make(chan *client.Packet, 1)
+	backendConn.EXPECT().Send(gomock.Any()).DoAndReturn(func(pkt *client.Packet) error {
+		switch pkt.Type {
+		case client.PacketType_DIAL_REQ:
+			select {
+			case dialRequests <- pkt:
+			default:
+				t.Errorf("received duplicate backend DIAL_REQ")
+			}
+		case client.PacketType_CLOSE_REQ:
+			select {
+			case closeRequests <- pkt:
+			default:
+				t.Errorf("received duplicate backend CLOSE_REQ")
+			}
+		default:
+			t.Errorf("backend Send packet type = %v, want DIAL_REQ or CLOSE_REQ", pkt.Type)
+		}
+		return nil
+	}).AnyTimes()
+
+	backend, err := NewBackend(backendConn)
+	if err != nil {
+		t.Fatalf("NewBackend: %v", err)
+	}
+	backendCtx, cancelBackend := context.WithCancel(backend.Context())
+	backend.conn = &backendConnWithContext{
+		AgentService_ConnectServer: backendConn,
+		ctx:                        backendCtx,
+	}
+	proxyServer := NewProxyServer(
+		"",
+		[]proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault},
+		1,
+		nil,
+		1,
+	)
+	proxyServer.addBackend(backend)
+
+	recvCh := make(chan *client.Packet)
+	consumerDone := make(chan struct{})
+	go func() {
+		defer close(consumerDone)
+		proxyServer.serveRecvBackend(backend, agentID, recvCh)
+	}()
+
+	frontendConn := newObservedHTTPConn()
+	responseWriter := newHijackingResponseWriter(frontendConn)
+	request := httptest.NewRequest(http.MethodConnect, "http://example.invalid", nil)
+	request.Host = target
+	tunnelDone := make(chan struct{})
+	go func() {
+		defer close(tunnelDone)
+		(&Tunnel{Server: proxyServer}).ServeHTTP(responseWriter, request)
+	}()
+
+	var (
+		closeRecvOnce sync.Once
+		feederDone    chan struct{}
+		dialID        int64
+		dialCaptured  bool
+	)
+	closeRecv := func() { closeRecvOnce.Do(func() { close(recvCh) }) }
+	t.Cleanup(func() {
+		// Teardown order is load-bearing:
+		//  1. Release the socket write and stop the feeder before closing recvCh,
+		//     otherwise the feeder could panic by sending to a closed channel.
+		//  2. Close the frontend and cancel the backend context so Tunnel exits
+		//     whether it is blocked in the established read loop or still waiting
+		//     for DIAL_RSP.
+		//  3. Only then close recvCh and wait for the consumer and Tunnel.
+		frontendConn.sink.release()
+		safeToCloseRecv := true
+		if feederDone != nil {
+			select {
+			case <-feederDone:
+			case <-time.After(holTestSafetyTimeout):
+				t.Errorf("backend packet feeder did not exit during cleanup")
+				safeToCloseRecv = false
+			}
+		}
+		if dialCaptured {
+			if pending := proxyServer.PendingDial.Remove(dialID); pending != nil {
+				_ = pending.CloseHTTP()
+			}
+		}
+		_ = frontendConn.Close()
+		cancelBackend()
+		if safeToCloseRecv {
+			closeRecv()
+			select {
+			case <-consumerDone:
+			case <-time.After(holTestSafetyTimeout):
+				t.Errorf("serveRecvBackend did not exit during cleanup")
+			}
+		}
+		select {
+		case <-tunnelDone:
+		case <-time.After(holTestSafetyTimeout):
+			t.Errorf("HTTP tunnel did not exit during cleanup")
+		}
+	})
+
+	var dialRequest *client.Packet
+	select {
+	case dialRequest = <-dialRequests:
+	case <-time.After(holTestSafetyTimeout):
+		t.Fatal("HTTP tunnel did not send DIAL_REQ to the backend")
+	}
+	dial := dialRequest.GetDialRequest()
+	if dial == nil {
+		t.Fatal("backend DIAL_REQ did not contain a dial request payload")
+	}
+	dialID = dial.Random
+	dialCaptured = true
+	if dial.Address != target {
+		t.Fatalf("backend DIAL_REQ = %v, want address %q", dial, target)
+	}
+
+	recvCh <- &client.Packet{
+		Type: client.PacketType_DIAL_RSP,
+		Payload: &client.Packet_DialResponse{
+			DialResponse: &client.DialResponse{Random: dialID, ConnectID: connectID},
+		},
+	}
+	select {
+	case <-frontendConn.sink.firstWriteStarted:
+	case <-time.After(holTestSafetyTimeout):
+		t.Fatal("HTTP tunnel did not begin writing the successful CONNECT response")
+	}
+
+	// DRAIN is a deterministic marker that the preceding DATA was handed to the
+	// sole writer. The unbuffered legacy handoff cannot complete until the writer
+	// finishes the CONNECT response.
+	feederDone = make(chan struct{})
+	go func() {
+		defer close(feederDone)
+		recvCh <- dataPkt(connectID, payload)
+		recvCh <- &client.Packet{Type: client.PacketType_DRAIN}
+	}()
+	frontendConn.sink.release()
+	select {
+	case <-feederDone:
+	case <-time.After(holTestSafetyTimeout):
+		t.Fatal("backend consumer did not hand off DATA after the CONNECT response completed")
+	}
+	deadline := time.NewTimer(holTestSafetyTimeout)
+	defer deadline.Stop()
+	for {
+		gotStream, _, _, _ := frontendConn.sink.snapshot()
+		if len(gotStream) >= len(wantStream) {
+			break
+		}
+		select {
+		case <-frontendConn.sink.streamUpdated:
+		case <-deadline.C:
+			t.Fatalf("frontend received %d bytes, want %d before close", len(gotStream), len(wantStream))
+		}
+	}
+
+	recvCh <- &client.Packet{
+		Type: client.PacketType_CLOSE_RSP,
+		Payload: &client.Packet_CloseResponse{
+			CloseResponse: &client.CloseResponse{ConnectID: connectID},
+		},
+	}
+	select {
+	case <-frontendConn.sink.closeObserved:
+	case <-time.After(holTestSafetyTimeout):
+		t.Fatal("frontend connection did not close after CLOSE_RSP")
+	}
+	closeRecv()
+	select {
+	case <-consumerDone:
+	case <-time.After(holTestSafetyTimeout):
+		t.Fatal("serveRecvBackend did not exit")
+	}
+	select {
+	case <-tunnelDone:
+	case <-time.After(holTestSafetyTimeout):
+		t.Fatal("HTTP tunnel did not exit after frontend close")
+	}
+	select {
+	case closeRequest := <-closeRequests:
+		closePayload := closeRequest.GetCloseRequest()
+		if closePayload == nil {
+			t.Fatal("backend CLOSE_REQ did not contain a close request payload")
+		}
+		if closePayload.ConnectID != connectID {
+			t.Fatalf("backend CLOSE_REQ connectID = %d, want %d", closePayload.ConnectID, connectID)
+		}
+	case <-time.After(holTestSafetyTimeout):
+		t.Fatal("HTTP tunnel did not send CLOSE_REQ after frontend close")
+	}
+
+	gotStream, _, _, _ := frontendConn.sink.snapshot()
+	if !bytes.Equal(gotStream, wantStream) {
+		t.Fatalf("frontend byte stream = %q, want CONNECT response followed by DATA %q", gotStream, wantStream)
 	}
 }
