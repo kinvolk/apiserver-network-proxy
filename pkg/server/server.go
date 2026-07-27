@@ -196,6 +196,15 @@ func flowControlFeaturesWereOffered(accepted, offered []client.FlowControlFeatur
 	return true
 }
 
+func hasDuplicateFlowControlFeature(features []client.FlowControlFeature) bool {
+	for i, feature := range features {
+		if slices.Contains(features[:i], feature) {
+			return true
+		}
+	}
+	return false
+}
+
 func NewPendingDialManager() *PendingDialManager {
 	return &PendingDialManager{
 		pendingDial: make(map[int64]*ProxyClientConnection),
@@ -1083,13 +1092,15 @@ func (s *ProxyServer) serveRecvBackend(backend *Backend, agentID string, recvCh 
 			}
 
 			frontend.setHTTPConnectionDetails(agentID, resp.ConnectID)
-			if !flowControlFeaturesWereOffered(resp.GetAcceptedFlowControlFeatures(), frontend.offeredFlowControlFeatures) {
-				klog.ErrorS(nil, "DIAL_RSP accepted unoffered flow-control feature",
+			acceptedFlowControlFeatures := resp.GetAcceptedFlowControlFeatures()
+			if hasDuplicateFlowControlFeature(acceptedFlowControlFeatures) ||
+				!flowControlFeaturesWereOffered(acceptedFlowControlFeatures, frontend.offeredFlowControlFeatures) {
+				klog.ErrorS(nil, "DIAL_RSP contains invalid accepted flow-control features",
 					"dialID", resp.Random,
 					"agentID", agentID,
 					"connectionID", resp.ConnectID,
 					"offeredFlowControlFeatures", frontend.offeredFlowControlFeatures,
-					"acceptedFlowControlFeatures", resp.GetAcceptedFlowControlFeatures(),
+					"acceptedFlowControlFeatures", acceptedFlowControlFeatures,
 				)
 				frontend.abortHTTP(s, httpConnectAbortFeatureMismatch)
 				break
