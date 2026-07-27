@@ -146,8 +146,32 @@ func httpConnectFlowControlDialRequest(t *testing.T, enabled bool) (*client.Dial
 // DIAL_RSP is therefore deliberately malformed: the server must reject it
 // before connection publication or a successful CONNECT response.
 func TestHTTPConnectRejectsAcceptedResponseFlowControlWithoutOffer(t *testing.T) {
+	testHTTPConnectRejectsFlowControlResponse(t, nil, []client.FlowControlFeature{
+		client.FlowControlFeature_AGENT_TO_SERVER_BYTE_WINDOW_V1,
+	})
+}
+
+// TestHTTPConnectRejectsDuplicateAcceptedResponseFlowControl starts after the
+// PendingDial handoff with response V1 recorded as offered. Repeating that
+// feature in the positive DIAL_RSP is malformed and must fail before HTTP 200.
+func TestHTTPConnectRejectsDuplicateAcceptedResponseFlowControl(t *testing.T) {
+	testHTTPConnectRejectsFlowControlResponse(t, []client.FlowControlFeature{
+		client.FlowControlFeature_AGENT_TO_SERVER_BYTE_WINDOW_V1,
+	}, []client.FlowControlFeature{
+		client.FlowControlFeature_AGENT_TO_SERVER_BYTE_WINDOW_V1,
+		client.FlowControlFeature_AGENT_TO_SERVER_BYTE_WINDOW_V1,
+	})
+}
+
+func testHTTPConnectRejectsFlowControlResponse(
+	t *testing.T,
+	offered []client.FlowControlFeature,
+	accepted []client.FlowControlFeature,
+) {
+	t.Helper()
+
 	const (
-		agentID   = "unoffered-flow-control-agent"
+		agentID   = "malformed-flow-control-agent"
 		dialID    = int64(6101)
 		connectID = int64(6102)
 	)
@@ -167,6 +191,8 @@ func TestHTTPConnectRejectsAcceptedResponseFlowControlWithoutOffer(t *testing.T)
 		backend:             backend,
 		agentID:             agentID,
 		httpInitialResponse: []byte(httpConnectSuccessResponse),
+
+		offeredFlowControlFeatures: slices.Clone(offered),
 	}
 	proxyServer.PendingDial.Add(dialID, connection)
 	consumer := startWriterTestBackendConsumer(t, proxyServer, backend, agentID, 1)
@@ -175,11 +201,9 @@ func TestHTTPConnectRejectsAcceptedResponseFlowControlWithoutOffer(t *testing.T)
 		Type: client.PacketType_DIAL_RSP,
 		Payload: &client.Packet_DialResponse{
 			DialResponse: &client.DialResponse{
-				Random:    dialID,
-				ConnectID: connectID,
-				AcceptedFlowControlFeatures: []client.FlowControlFeature{
-					client.FlowControlFeature_AGENT_TO_SERVER_BYTE_WINDOW_V1,
-				},
+				Random:                      dialID,
+				ConnectID:                   connectID,
+				AcceptedFlowControlFeatures: slices.Clone(accepted),
 			},
 		},
 	}
@@ -187,17 +211,17 @@ func TestHTTPConnectRejectsAcceptedResponseFlowControlWithoutOffer(t *testing.T)
 	select {
 	case <-connected:
 		written, _, _ := frontendHTTP.snapshot()
-		t.Fatalf("accepted-but-not-offered DIAL_RSP established the tunnel and wrote %q", written)
+		t.Fatalf("DIAL_RSP with offered features %v and accepted features %v established the tunnel and wrote %q", offered, accepted, written)
 	case <-frontendHTTP.closeCh:
 	case <-time.After(writerTestSafetyTimeout):
-		t.Fatal("server did not finish accepted-but-not-offered DIAL_RSP handling")
+		t.Fatalf("server did not finish malformed DIAL_RSP handling with offered features %v and accepted features %v", offered, accepted)
 	}
 
 	written, _, _ := frontendHTTP.snapshot()
 	if bytes.HasPrefix(written, []byte(httpConnectSuccessResponse)) {
-		t.Fatalf("accepted-but-not-offered DIAL_RSP wrote successful CONNECT response %q", written)
+		t.Fatalf("DIAL_RSP with offered features %v and accepted features %v wrote successful CONNECT response %q", offered, accepted, written)
 	}
 	if _, err := proxyServer.getFrontend(agentID, connectID); err == nil {
-		t.Fatal("accepted-but-not-offered DIAL_RSP published an established connection")
+		t.Fatalf("DIAL_RSP with offered features %v and accepted features %v published an established connection", offered, accepted)
 	}
 }
