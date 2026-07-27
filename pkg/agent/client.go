@@ -141,6 +141,10 @@ type Client struct {
 
 	cs *ClientSet // the clientset that includes this AgentClient.
 
+	// Immutable HTTP-CONNECT flow-control acceptance policy for this client
+	// stream.
+	enableHTTPConnectFlowControl bool
+
 	stream           agent.AgentService_ConnectClient
 	agentID          string
 	agentIdentifiers string
@@ -168,7 +172,16 @@ type Client struct {
 }
 
 func newAgentClient(address, agentID, agentIdentifiers string, cs *ClientSet, opts ...grpc.DialOption) (*Client, int, error) {
-	a := &Client{
+	a := newUnconnectedAgentClient(address, agentID, agentIdentifiers, cs, opts...)
+	serverCount, err := a.Connect()
+	if err != nil {
+		return nil, 0, err
+	}
+	return a, serverCount, nil
+}
+
+func newUnconnectedAgentClient(address, agentID, agentIdentifiers string, cs *ClientSet, opts ...grpc.DialOption) *Client {
+	return &Client{
 		cs:                      cs,
 		address:                 address,
 		agentID:                 agentID,
@@ -181,11 +194,6 @@ func newAgentClient(address, agentID, agentIdentifiers string, cs *ClientSet, op
 		connManager:             newConnectionManager(),
 		warnOnChannelLimit:      cs.warnOnChannelLimit,
 	}
-	serverCount, err := a.Connect()
-	if err != nil {
-		return nil, 0, err
-	}
-	return a, serverCount, nil
 }
 
 // Connect makes the grpc dial to the proxy server. It returns the count

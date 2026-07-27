@@ -79,6 +79,29 @@ func TestHTTPConnectFlowControlFlag(t *testing.T) {
 	}
 }
 
+func TestHTTPConnectFlowControlPolicyReachesClientSetConfig(t *testing.T) {
+	tests := []struct {
+		name    string
+		enabled bool
+	}{
+		{name: "disabled", enabled: false},
+		{name: "enabled", enabled: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			options := NewGrpcProxyAgentOptions()
+			options.EnableHTTPConnectFlowControl = tt.enabled
+			config := options.ClientSetConfig()
+
+			options.EnableHTTPConnectFlowControl = !tt.enabled
+			if got := config.EnableHTTPConnectFlowControl; got != tt.enabled {
+				t.Fatalf("client-set config HTTP-CONNECT flow-control policy = %t, want snapshotted %t from agent options", got, tt.enabled)
+			}
+		})
+	}
+}
+
 func assertDefaultValue(t *testing.T, fieldName string, actual, expected interface{}) {
 	t.Helper()
 	assert.IsType(t, expected, actual, "For field %s, got the wrong type.", fieldName)
