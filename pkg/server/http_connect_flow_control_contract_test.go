@@ -93,6 +93,143 @@ func TestHTTPConnectAcceptsOfferedResponseFlowControl(t *testing.T) {
 	}
 }
 
+func TestHTTPConnectEnforcesResponseFlowControlMode(t *testing.T) {
+	const (
+		firstConnectID  = int64(6301)
+		secondConnectID = int64(6302)
+	)
+
+	wantOffer := []client.FlowControlFeature{
+		client.FlowControlFeature_AGENT_TO_SERVER_BYTE_WINDOW_V1,
+	}
+	tests := []struct {
+		name            string
+		firstMode       httpConnectResponseMode
+		secondMode      httpConnectResponseMode
+		wantEstablished bool
+	}{
+		{
+			name:            "response V1 to response V1",
+			firstMode:       httpConnectResponseModeAgentToServerByteWindowV1,
+			secondMode:      httpConnectResponseModeAgentToServerByteWindowV1,
+			wantEstablished: true,
+		},
+		{
+			name:       "response V1 to legacy",
+			firstMode:  httpConnectResponseModeAgentToServerByteWindowV1,
+			secondMode: httpConnectResponseModeLegacy,
+		},
+		{
+			name:       "legacy to response V1",
+			firstMode:  httpConnectResponseModeLegacy,
+			secondMode: httpConnectResponseModeAgentToServerByteWindowV1,
+		},
+		{
+			name:            "legacy to legacy",
+			firstMode:       httpConnectResponseModeLegacy,
+			secondMode:      httpConnectResponseModeLegacy,
+			wantEstablished: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			acceptedForMode := func(mode httpConnectResponseMode, offered []client.FlowControlFeature) []client.FlowControlFeature {
+				switch mode {
+				case httpConnectResponseModeLegacy:
+					return nil
+				case httpConnectResponseModeAgentToServerByteWindowV1:
+					return slices.Clone(offered)
+				default:
+					t.Fatalf("unsupported test response mode %q", mode)
+					return nil
+				}
+			}
+
+			first := newHTTPConnectFlowControlDialFixture(t, true)
+			firstOffer := slices.Clone(first.dialRequest.GetOfferedFlowControlFeatures())
+			if !slices.Equal(firstOffer, wantOffer) {
+				t.Fatalf("first DIAL_REQ offered flow-control features = %v, want %v", firstOffer, wantOffer)
+			}
+
+			consumer := startWriterTestBackendConsumer(t, first.proxyServer, first.backend, first.agentID, 1)
+			consumer.recvCh <- &client.Packet{
+				Type: client.PacketType_DIAL_RSP,
+				Payload: &client.Packet_DialResponse{
+					DialResponse: &client.DialResponse{
+						Random:                      first.dialRequest.GetRandom(),
+						ConnectID:                   firstConnectID,
+						AcceptedFlowControlFeatures: acceptedForMode(tt.firstMode, firstOffer),
+					},
+				},
+			}
+			select {
+			case <-first.pending.connected:
+			case <-time.After(writerTestSafetyTimeout):
+				t.Fatalf("server did not establish the first %q dial", tt.firstMode)
+			}
+
+			second := first.startDial(t)
+			secondOffer := slices.Clone(second.dialRequest.GetOfferedFlowControlFeatures())
+			if !slices.Equal(secondOffer, wantOffer) {
+				t.Fatalf("second DIAL_REQ offered flow-control features = %v, want %v", secondOffer, wantOffer)
+			}
+			consumer.recvCh <- &client.Packet{
+				Type: client.PacketType_DIAL_RSP,
+				Payload: &client.Packet_DialResponse{
+					DialResponse: &client.DialResponse{
+						Random:                      second.dialRequest.GetRandom(),
+						ConnectID:                   secondConnectID,
+						AcceptedFlowControlFeatures: acceptedForMode(tt.secondMode, secondOffer),
+					},
+				},
+			}
+
+			if tt.wantEstablished {
+				select {
+				case <-second.pending.connected:
+				case <-second.frontendConn.sink.closeObserved:
+					written, _, _, _ := second.frontendConn.sink.snapshot()
+					t.Fatalf("DIAL_RSP kept backend stream response mode %q but closed the tunnel after writing %q", tt.firstMode, written)
+				case <-time.After(writerTestSafetyTimeout):
+					t.Fatalf("server did not establish the second %q dial", tt.secondMode)
+				}
+
+				written, _, _, _ := second.frontendConn.sink.snapshot()
+				if !bytes.Equal(written, []byte(httpConnectSuccessResponse)) {
+					t.Fatalf("DIAL_RSP kept backend stream response mode %q and wrote %q, want complete successful CONNECT response", tt.firstMode, written)
+				}
+				if got, err := first.proxyServer.getFrontend(first.agentID, secondConnectID); err != nil || got != second.pending {
+					t.Fatalf("second established connection = %p, %v; want %p", got, err, second.pending)
+				}
+				if got := second.pending.httpConnectResponseMode; got != tt.secondMode {
+					t.Fatalf("second connection response mode = %q, want %q", got, tt.secondMode)
+				}
+			} else {
+				select {
+				case <-second.pending.connected:
+					written, _, _, _ := second.frontendConn.sink.snapshot()
+					t.Fatalf("DIAL_RSP changed backend stream response mode from %q to %q and established the tunnel with %q", tt.firstMode, tt.secondMode, written)
+				case <-second.frontendConn.sink.closeObserved:
+				case <-time.After(writerTestSafetyTimeout):
+					t.Fatalf("server did not finish handling HTTP CONNECT response mode change from %q to %q", tt.firstMode, tt.secondMode)
+				}
+
+				written, _, _, _ := second.frontendConn.sink.snapshot()
+				if bytes.HasPrefix(written, []byte(httpConnectSuccessResponse)) {
+					t.Fatalf("DIAL_RSP changed backend stream response mode from %q to %q and wrote successful CONNECT response %q", tt.firstMode, tt.secondMode, written)
+				}
+				if _, err := first.proxyServer.getFrontend(first.agentID, secondConnectID); err == nil {
+					t.Fatalf("DIAL_RSP changed backend stream response mode from %q to %q and published an established connection", tt.firstMode, tt.secondMode)
+				}
+			}
+			if got := first.pending.httpConnectResponseMode; got != tt.firstMode {
+				t.Fatalf("first connection response mode = %q, want %q", got, tt.firstMode)
+			}
+		})
+	}
+}
+
 func httpConnectFlowControlDialRequest(t *testing.T, enabled bool) (*client.DialRequest, *ProxyClientConnection) {
 	t.Helper()
 	fixture := newHTTPConnectFlowControlDialFixture(t, enabled)
@@ -100,12 +237,15 @@ func httpConnectFlowControlDialRequest(t *testing.T, enabled bool) (*client.Dial
 }
 
 type httpConnectFlowControlDialFixture struct {
-	dialRequest  *client.DialRequest
-	pending      *ProxyClientConnection
-	proxyServer  *ProxyServer
-	backend      *Backend
-	agentID      string
-	frontendConn *observedHTTPConn
+	dialRequest   *client.DialRequest
+	pending       *ProxyClientConnection
+	proxyServer   *ProxyServer
+	backend       *Backend
+	agentID       string
+	frontendConn  *observedHTTPConn
+	dialRequests  chan *client.DialRequest
+	cancelBackend context.CancelFunc
+	target        string
 }
 
 func newHTTPConnectFlowControlDialFixture(t *testing.T, enabled bool) *httpConnectFlowControlDialFixture {
@@ -120,8 +260,11 @@ func newHTTPConnectFlowControlDialFixture(t *testing.T, enabled bool) *httpConne
 	backendConn := mockAgentConn(ctrl, agentID, nil)
 	dialRequests := make(chan *client.DialRequest, 1)
 	backendConn.EXPECT().Send(gomock.Any()).DoAndReturn(func(pkt *client.Packet) error {
+		if pkt.Type == client.PacketType_CLOSE_REQ {
+			return nil
+		}
 		if pkt.Type != client.PacketType_DIAL_REQ {
-			t.Errorf("backend packet type = %v, want DIAL_REQ", pkt.Type)
+			t.Errorf("backend packet type = %v, want DIAL_REQ or CLOSE_REQ", pkt.Type)
 			return nil
 		}
 		dialRequest := pkt.GetDialRequest()
@@ -159,46 +302,63 @@ func newHTTPConnectFlowControlDialFixture(t *testing.T, enabled bool) *httpConne
 	// proves that the published backend stream owns an immutable snapshot.
 	proxyServer.SetHTTPConnectFlowControlEnabled(!enabled)
 
+	fixture := &httpConnectFlowControlDialFixture{
+		proxyServer:   proxyServer,
+		backend:       backend,
+		agentID:       agentID,
+		dialRequests:  dialRequests,
+		cancelBackend: cancelBackend,
+		target:        target,
+	}
+	return fixture.startDial(t)
+}
+
+func (f *httpConnectFlowControlDialFixture) startDial(t *testing.T) *httpConnectFlowControlDialFixture {
+	t.Helper()
+
 	frontendConn := newObservedHTTPConn()
 	frontendConn.sink.release()
-	request := httptest.NewRequest(http.MethodConnect, "http://"+target, nil)
-	request.Host = target
+	request := httptest.NewRequest(http.MethodConnect, "http://"+f.target, nil)
+	request.Host = f.target
 	tunnelDone := make(chan struct{})
 	go func() {
 		defer close(tunnelDone)
-		(&Tunnel{Server: proxyServer}).ServeHTTP(newHijackingResponseWriter(frontendConn), request)
+		(&Tunnel{Server: f.proxyServer}).ServeHTTP(newHijackingResponseWriter(frontendConn), request)
 	}()
 	t.Cleanup(func() {
-		cancelBackend()
+		f.cancelBackend()
+		_ = frontendConn.Close()
 		select {
 		case <-tunnelDone:
 		case <-time.After(holTestSafetyTimeout):
 			t.Errorf("HTTP tunnel did not exit during cleanup")
 		}
-		_ = frontendConn.Close()
 	})
 
 	var dialRequest *client.DialRequest
 	select {
-	case dialRequest = <-dialRequests:
+	case dialRequest = <-f.dialRequests:
 	case <-time.After(holTestSafetyTimeout):
 		t.Fatal("HTTP tunnel did not send DIAL_REQ")
 	}
 
-	proxyServer.PendingDial.mu.RLock()
-	pending := proxyServer.PendingDial.pendingDial[dialRequest.GetRandom()]
-	proxyServer.PendingDial.mu.RUnlock()
+	f.proxyServer.PendingDial.mu.RLock()
+	pending := f.proxyServer.PendingDial.pendingDial[dialRequest.GetRandom()]
+	f.proxyServer.PendingDial.mu.RUnlock()
 	if pending == nil {
 		t.Fatal("sent DIAL_REQ has no pending logical dial")
 	}
 
 	return &httpConnectFlowControlDialFixture{
-		dialRequest:  dialRequest,
-		pending:      pending,
-		proxyServer:  proxyServer,
-		backend:      backend,
-		agentID:      agentID,
-		frontendConn: frontendConn,
+		dialRequest:   dialRequest,
+		pending:       pending,
+		proxyServer:   f.proxyServer,
+		backend:       f.backend,
+		agentID:       f.agentID,
+		frontendConn:  frontendConn,
+		dialRequests:  f.dialRequests,
+		cancelBackend: f.cancelBackend,
+		target:        f.target,
 	}
 }
 

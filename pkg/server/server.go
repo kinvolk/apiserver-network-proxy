@@ -93,6 +93,14 @@ const defaultBackendDialTimeout = 0
 
 var errBackendDialTimeout = errors.New("timed out waiting for backend dial")
 
+type httpConnectResponseMode string
+
+const (
+	httpConnectResponseModeUnset                     httpConnectResponseMode = ""
+	httpConnectResponseModeLegacy                    httpConnectResponseMode = "legacy"
+	httpConnectResponseModeAgentToServerByteWindowV1 httpConnectResponseMode = "agent_to_server_byte_window_v1"
+)
+
 type ProxyClientConnection struct {
 	Mode        string
 	HTTP        io.ReadWriter
@@ -107,6 +115,8 @@ type ProxyClientConnection struct {
 	dialAddress string // cached for logging
 
 	offeredFlowControlFeatures []client.FlowControlFeature
+	// Set once before connection publication and immutable afterward.
+	httpConnectResponseMode httpConnectResponseMode
 
 	// HTTP-CONNECT output and terminal state. httpMu protects writer
 	// attachment, terminal-before-attachment, connection identifiers used by
