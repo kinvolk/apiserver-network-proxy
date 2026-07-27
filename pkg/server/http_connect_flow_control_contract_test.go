@@ -54,7 +54,61 @@ func TestHTTPConnectDialDoesNotOfferFlowControlWhenDisabled(t *testing.T) {
 	}
 }
 
+func TestHTTPConnectAcceptsOfferedResponseFlowControl(t *testing.T) {
+	const connectID = int64(6201)
+
+	fixture := newHTTPConnectFlowControlDialFixture(t, true)
+	want := []client.FlowControlFeature{
+		client.FlowControlFeature_AGENT_TO_SERVER_BYTE_WINDOW_V1,
+	}
+	offered := slices.Clone(fixture.dialRequest.GetOfferedFlowControlFeatures())
+	if !slices.Equal(offered, want) {
+		t.Fatalf("DIAL_REQ offered flow-control features = %v, want %v", offered, want)
+	}
+
+	consumer := startWriterTestBackendConsumer(t, fixture.proxyServer, fixture.backend, fixture.agentID, 1)
+	consumer.recvCh <- &client.Packet{
+		Type: client.PacketType_DIAL_RSP,
+		Payload: &client.Packet_DialResponse{
+			DialResponse: &client.DialResponse{
+				Random:                      fixture.dialRequest.GetRandom(),
+				ConnectID:                   connectID,
+				AcceptedFlowControlFeatures: offered,
+			},
+		},
+	}
+
+	select {
+	case <-fixture.pending.connected:
+	case <-time.After(writerTestSafetyTimeout):
+		t.Fatal("server did not establish DIAL_RSP accepting the recorded offer")
+	}
+
+	written, _, _, _ := fixture.frontendConn.sink.snapshot()
+	if !bytes.Equal(written, []byte(httpConnectSuccessResponse)) {
+		t.Fatalf("valid accepted DIAL_RSP wrote %q, want complete successful CONNECT response", written)
+	}
+	if got, err := fixture.proxyServer.getFrontend(fixture.agentID, connectID); err != nil || got != fixture.pending {
+		t.Fatalf("established connection = %p, %v; want %p", got, err, fixture.pending)
+	}
+}
+
 func httpConnectFlowControlDialRequest(t *testing.T, enabled bool) (*client.DialRequest, *ProxyClientConnection) {
+	t.Helper()
+	fixture := newHTTPConnectFlowControlDialFixture(t, enabled)
+	return fixture.dialRequest, fixture.pending
+}
+
+type httpConnectFlowControlDialFixture struct {
+	dialRequest  *client.DialRequest
+	pending      *ProxyClientConnection
+	proxyServer  *ProxyServer
+	backend      *Backend
+	agentID      string
+	frontendConn *observedHTTPConn
+}
+
+func newHTTPConnectFlowControlDialFixture(t *testing.T, enabled bool) *httpConnectFlowControlDialFixture {
 	t.Helper()
 
 	const (
@@ -138,7 +192,14 @@ func httpConnectFlowControlDialRequest(t *testing.T, enabled bool) (*client.Dial
 		t.Fatal("sent DIAL_REQ has no pending logical dial")
 	}
 
-	return dialRequest, pending
+	return &httpConnectFlowControlDialFixture{
+		dialRequest:  dialRequest,
+		pending:      pending,
+		proxyServer:  proxyServer,
+		backend:      backend,
+		agentID:      agentID,
+		frontendConn: frontendConn,
+	}
 }
 
 // TestHTTPConnectRejectsAcceptedResponseFlowControlWithoutOffer starts at the
