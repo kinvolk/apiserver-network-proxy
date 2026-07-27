@@ -59,8 +59,14 @@ func TestServeData_HTTP(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	// Simulate sending KAS DIAL_REQ to (Agent) Client
+	// Before agent-side acceptance exists, offered response V1 and an unknown
+	// future feature must not change legacy dial, DATA, or close behavior.
+	// When acceptance lands, this setup must explicitly select disabled policy.
 	dialPacket := newDialPacket("tcp", ts.URL[len("http://"):], 111)
+	dialPacket.GetDialRequest().OfferedFlowControlFeatures = []client.FlowControlFeature{
+		client.FlowControlFeature_AGENT_TO_SERVER_BYTE_WINDOW_V1,
+		client.FlowControlFeature(1 << 30),
+	}
 	err = stream.Send(dialPacket)
 	if err != nil {
 		t.Fatal(err.Error())
@@ -81,6 +87,9 @@ func TestServeData_HTTP(t *testing.T) {
 	connID := dialRsp.DialResponse.ConnectID
 	if dialRsp.DialResponse.Random != 111 {
 		t.Errorf("expect random=111; got %v", dialRsp.DialResponse.Random)
+	}
+	if got := dialRsp.DialResponse.GetAcceptedFlowControlFeatures(); len(got) != 0 {
+		t.Fatalf("pre-acceptance agent accepted flow-control features %v", got)
 	}
 
 	// Send Data (HTTP Request) via (Agent) Client to the test http server
