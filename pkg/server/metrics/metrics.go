@@ -274,7 +274,7 @@ func (s *ServerMetrics) ObserveDialLatency(elapsed time.Duration) {
 	s.endpointLatencies.WithLabelValues().Observe(elapsed.Seconds())
 }
 
-// ObserveFrontendWriteLatency records the latency of blocking on stream send to the client.
+// ObserveFrontendWriteLatency records gRPC stream and HTTP socket write latency.
 func (s *ServerMetrics) ObserveFrontendWriteLatency(elapsed time.Duration) {
 	s.frontendLatencies.WithLabelValues().Observe(elapsed.Seconds())
 }
