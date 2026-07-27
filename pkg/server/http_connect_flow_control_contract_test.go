@@ -32,23 +32,29 @@ import (
 )
 
 func TestHTTPConnectDialOffersResponseFlowControlV1WhenEnabled(t *testing.T) {
-	dialRequest := httpConnectFlowControlDialRequest(t, true)
+	dialRequest, pending := httpConnectFlowControlDialRequest(t, true)
+	sentOffer := slices.Clone(dialRequest.GetOfferedFlowControlFeatures())
 	want := []client.FlowControlFeature{
 		client.FlowControlFeature_AGENT_TO_SERVER_BYTE_WINDOW_V1,
 	}
-	if got := dialRequest.GetOfferedFlowControlFeatures(); !slices.Equal(got, want) {
+	if got := sentOffer; !slices.Equal(got, want) {
 		t.Fatalf("DIAL_REQ offered flow-control features = %v, want %v", got, want)
+	}
+
+	dialRequest.OfferedFlowControlFeatures[0] = client.FlowControlFeature_FLOW_CONTROL_FEATURE_UNSPECIFIED
+	if got := pending.offeredFlowControlFeatures; !slices.Equal(got, sentOffer) {
+		t.Fatalf("pending dial recorded flow-control features = %v, want defensive copy of sent offer %v", got, sentOffer)
 	}
 }
 
 func TestHTTPConnectDialDoesNotOfferFlowControlWhenDisabled(t *testing.T) {
-	dialRequest := httpConnectFlowControlDialRequest(t, false)
+	dialRequest, _ := httpConnectFlowControlDialRequest(t, false)
 	if got := dialRequest.GetOfferedFlowControlFeatures(); len(got) != 0 {
 		t.Fatalf("DIAL_REQ offered flow-control features = %v, want no offer", got)
 	}
 }
 
-func httpConnectFlowControlDialRequest(t *testing.T, enabled bool) *client.DialRequest {
+func httpConnectFlowControlDialRequest(t *testing.T, enabled bool) (*client.DialRequest, *ProxyClientConnection) {
 	t.Helper()
 
 	const (
@@ -125,7 +131,14 @@ func httpConnectFlowControlDialRequest(t *testing.T, enabled bool) *client.DialR
 		t.Fatal("HTTP tunnel did not send DIAL_REQ")
 	}
 
-	return dialRequest
+	proxyServer.PendingDial.mu.RLock()
+	pending := proxyServer.PendingDial.pendingDial[dialRequest.GetRandom()]
+	proxyServer.PendingDial.mu.RUnlock()
+	if pending == nil {
+		t.Fatal("sent DIAL_REQ has no pending logical dial")
+	}
+
+	return dialRequest, pending
 }
 
 // TestHTTPConnectRejectsAcceptedResponseFlowControlWithoutOffer starts at the

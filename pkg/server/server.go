@@ -105,6 +105,8 @@ type ProxyClientConnection struct {
 	backend     *Backend
 	dialAddress string // cached for logging
 
+	offeredFlowControlFeatures []client.FlowControlFeature
+
 	// HTTP-CONNECT output and terminal state. httpMu protects writer
 	// attachment, terminal-before-attachment, connection identifiers used by
 	// asynchronous cleanup, and CLOSE_REQ suppression. It is never held during
