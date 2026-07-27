@@ -199,6 +199,8 @@ func (cc *ClientSetConfig) NewAgentClientSet(drainCh, stopCh <-chan struct{}) *C
 		xfrChannelSize:          cc.XfrChannelSize,
 		stopCh:                  stopCh,
 		serverCountSource:       cc.ServerCountSource,
+
+		enableHTTPConnectFlowControl: cc.EnableHTTPConnectFlowControl,
 	}
 }
 

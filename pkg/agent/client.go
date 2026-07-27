@@ -193,6 +193,8 @@ func newUnconnectedAgentClient(address, agentID, agentIdentifiers string, cs *Cl
 		serviceAccountTokenPath: cs.serviceAccountTokenPath,
 		connManager:             newConnectionManager(),
 		warnOnChannelLimit:      cs.warnOnChannelLimit,
+
+		enableHTTPConnectFlowControl: cs.enableHTTPConnectFlowControl,
 	}
 }
 

@@ -113,6 +113,8 @@ func (o *GrpcProxyAgentOptions) ClientSetConfig(dialOptions ...grpc.DialOption) 
 		SyncForever:             o.SyncForever,
 		XfrChannelSize:          o.XfrChannelSize,
 		ServerCountSource:       o.ServerCountSource,
+
+		EnableHTTPConnectFlowControl: o.EnableHTTPConnectFlowControl,
 	}
 }
 
