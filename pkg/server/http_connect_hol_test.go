@@ -31,9 +31,11 @@ import (
 	"testing"
 	"time"
 
+	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/mock/gomock"
 
 	client "sigs.k8s.io/apiserver-network-proxy/konnectivity-client/proto/client"
+	"sigs.k8s.io/apiserver-network-proxy/pkg/server/metrics"
 	"sigs.k8s.io/apiserver-network-proxy/pkg/server/proxystrategies"
 	"sigs.k8s.io/apiserver-network-proxy/proto/agent"
 )
@@ -1215,5 +1217,627 @@ func TestHTTPConnectResponsePrecedesTunnelData(t *testing.T) {
 	gotStream, _, _, _ := frontendConn.sink.snapshot()
 	if !bytes.Equal(gotStream, wantStream) {
 		t.Fatalf("frontend byte stream = %q, want CONNECT response followed by DATA %q", gotStream, wantStream)
+	}
+}
+
+// TestConcurrentHTTPFrontendAndBackendClose targets overlapping frontend EOF
+// and backend CLOSE_RSP for the same established HTTP-CONNECT tunnel.
+//
+// The test:
+//  1. Establishes a real Tunnel and verifies the successful HTTP 200 response.
+//  2. Closes the frontend peer so Tunnel initiates backend CLOSE_REQ.
+//  3. Pauses that CLOSE_REQ in flight and delivers backend CLOSE_RSP.
+//  4. Requires CLOSE_RSP to close the frontend, then releases CLOSE_REQ.
+//  5. Requires exactly one correctly addressed CLOSE_REQ, both serving paths to
+//     exit, no socket operation in flight, and no established or pending state.
+//
+// Close ownership is not assigned to any goroutine, queue, or state-machine
+// implementation; only protocol-visible shutdown and final state are asserted.
+func TestConcurrentHTTPFrontendAndBackendClose(t *testing.T) {
+	const (
+		agentID   = "agent-1"
+		connectID = int64(1001)
+		target    = "istiod-stable.istio-system.svc:443"
+	)
+	connectResponse := []byte("HTTP/1.1 200 Connection Established\r\n\r\n")
+
+	ctrl := gomock.NewController(t)
+	backendConn := mockAgentConn(ctrl, agentID, []string{})
+	dialRequests := make(chan *client.Packet, 1)
+	closeRequestStarted := make(chan struct{})
+	releaseCloseRequest := make(chan struct{})
+	var (
+		closeRequestCount atomic.Int32
+		closeStartedOnce  sync.Once
+		closeReleaseOnce  sync.Once
+	)
+	releaseBackendClose := func() {
+		closeReleaseOnce.Do(func() { close(releaseCloseRequest) })
+	}
+	backendConn.EXPECT().Send(gomock.Any()).DoAndReturn(func(pkt *client.Packet) error {
+		switch pkt.Type {
+		case client.PacketType_DIAL_REQ:
+			select {
+			case dialRequests <- pkt:
+			default:
+				t.Errorf("received duplicate backend DIAL_REQ")
+			}
+		case client.PacketType_CLOSE_REQ:
+			if count := closeRequestCount.Add(1); count != 1 {
+				t.Errorf("backend received %d CLOSE_REQ packets, want exactly one", count)
+			}
+			closePayload := pkt.GetCloseRequest()
+			if closePayload == nil {
+				t.Errorf("backend CLOSE_REQ did not contain a close request payload")
+			} else if closePayload.ConnectID != connectID {
+				t.Errorf("backend CLOSE_REQ connectID = %d, want %d", closePayload.ConnectID, connectID)
+			}
+			closeStartedOnce.Do(func() { close(closeRequestStarted) })
+			<-releaseCloseRequest
+		default:
+			t.Errorf("backend Send packet type = %v, want DIAL_REQ or CLOSE_REQ", pkt.Type)
+		}
+		return nil
+	}).AnyTimes()
+
+	backend, err := NewBackend(backendConn)
+	if err != nil {
+		t.Fatalf("NewBackend: %v", err)
+	}
+	backendCtx, cancelBackend := context.WithCancel(backend.Context())
+	backend.conn = &backendConnWithContext{
+		AgentService_ConnectServer: backendConn,
+		ctx:                        backendCtx,
+	}
+	proxyServer := NewProxyServer(
+		"",
+		[]proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault},
+		1,
+		nil,
+		1,
+	)
+	proxyServer.addBackend(backend)
+
+	recvCh := make(chan *client.Packet)
+	consumerDone := make(chan struct{})
+	go func() {
+		defer close(consumerDone)
+		proxyServer.serveRecvBackend(backend, agentID, recvCh)
+	}()
+
+	frontendConn := newObservedHTTPConn()
+	// This test does not exercise a slow socket. Let the CONNECT response write
+	// complete normally before initiating either close path.
+	frontendConn.sink.release()
+	responseWriter := newHijackingResponseWriter(frontendConn)
+	request := httptest.NewRequest(http.MethodConnect, "http://example.invalid", nil)
+	request.Host = target
+	tunnelDone := make(chan struct{})
+	go func() {
+		defer close(tunnelDone)
+		(&Tunnel{Server: proxyServer}).ServeHTTP(responseWriter, request)
+	}()
+
+	var (
+		closeRecvOnce sync.Once
+		dialID        int64
+		dialCaptured  bool
+	)
+	closeRecv := func() { closeRecvOnce.Do(func() { close(recvCh) }) }
+	t.Cleanup(func() {
+		releaseBackendClose()
+		frontendConn.sink.release()
+		if dialCaptured {
+			if pending := proxyServer.PendingDial.Remove(dialID); pending != nil {
+				_ = pending.CloseHTTP()
+			}
+		}
+		_ = frontendConn.peer.Close()
+		_ = frontendConn.Close()
+		cancelBackend()
+		closeRecv()
+		select {
+		case <-consumerDone:
+		case <-time.After(holTestSafetyTimeout):
+			t.Errorf("serveRecvBackend did not exit during cleanup")
+		}
+		select {
+		case <-tunnelDone:
+		case <-time.After(holTestSafetyTimeout):
+			t.Errorf("HTTP tunnel did not exit during cleanup")
+		}
+	})
+
+	var dialRequest *client.Packet
+	select {
+	case dialRequest = <-dialRequests:
+	case <-time.After(holTestSafetyTimeout):
+		t.Fatal("HTTP tunnel did not send DIAL_REQ to the backend")
+	}
+	dial := dialRequest.GetDialRequest()
+	if dial == nil {
+		t.Fatal("backend DIAL_REQ did not contain a dial request payload")
+	}
+	dialID = dial.Random
+	dialCaptured = true
+	if dial.Address != target {
+		t.Fatalf("backend DIAL_REQ = %v, want address %q", dial, target)
+	}
+
+	recvCh <- &client.Packet{
+		Type: client.PacketType_DIAL_RSP,
+		Payload: &client.Packet_DialResponse{
+			DialResponse: &client.DialResponse{Random: dialID, ConnectID: connectID},
+		},
+	}
+	select {
+	case <-frontendConn.sink.streamUpdated:
+	case <-time.After(holTestSafetyTimeout):
+		t.Fatal("frontend did not receive the successful CONNECT response")
+	}
+	gotResponse, _, _, _ := frontendConn.sink.snapshot()
+	if !bytes.Equal(gotResponse, connectResponse) {
+		t.Fatalf("frontend byte stream before close = %q, want %q", gotResponse, connectResponse)
+	}
+
+	// Closing the peer supplies frontend EOF. Tunnel begins CLOSE_REQ and the
+	// mock pauses it in flight, creating a deterministic overlap window for the
+	// backend CLOSE_RSP path.
+	if err := frontendConn.peer.Close(); err != nil {
+		t.Fatalf("closing frontend peer: %v", err)
+	}
+	select {
+	case <-closeRequestStarted:
+	case <-time.After(holTestSafetyTimeout):
+		t.Fatal("frontend EOF did not initiate backend CLOSE_REQ")
+	}
+
+	recvCh <- &client.Packet{
+		Type: client.PacketType_CLOSE_RSP,
+		Payload: &client.Packet_CloseResponse{
+			CloseResponse: &client.CloseResponse{ConnectID: connectID},
+		},
+	}
+	select {
+	case <-frontendConn.sink.closeObserved:
+	case <-time.After(holTestSafetyTimeout):
+		t.Fatal("backend CLOSE_RSP did not close the frontend socket")
+	}
+
+	releaseBackendClose()
+	select {
+	case <-tunnelDone:
+	case <-time.After(holTestSafetyTimeout):
+		t.Fatal("HTTP tunnel did not exit after concurrent frontend/backend close")
+	}
+	closeRecv()
+	select {
+	case <-consumerDone:
+	case <-time.After(holTestSafetyTimeout):
+		t.Fatal("serveRecvBackend did not exit after concurrent close")
+	}
+
+	if got := closeRequestCount.Load(); got != 1 {
+		t.Fatalf("backend CLOSE_REQ count = %d, want 1", got)
+	}
+	_, _, closed, inFlight := frontendConn.sink.snapshot()
+	if !closed {
+		t.Fatal("frontend socket did not reach a terminal closed state")
+	}
+	if inFlight != 0 {
+		t.Fatalf("frontend closed with %d socket operations still in flight", inFlight)
+	}
+	if _, err := proxyServer.getFrontend(agentID, connectID); err == nil {
+		t.Fatal("connection remained or was recreated in established state after concurrent close")
+	}
+	proxyServer.PendingDial.mu.RLock()
+	_, stillPending := proxyServer.PendingDial.pendingDial[dialID]
+	proxyServer.PendingDial.mu.RUnlock()
+	if stillPending {
+		t.Fatal("connection reappeared in pending state after concurrent close")
+	}
+}
+
+// TestOneOutstandingHTTPDataPacketPerSlowFrontendDoesNotDelayDialResponse pins
+// the preparatory writer shell's first-packet handoff across several slow
+// connections.
+//
+// For slow-frontend counts 2 and 10, the test:
+//  1. Registers each slow connection on one agent stream.
+//  2. Blocks the connections in deterministic stream order.
+//  3. Delivers DIAL_RSP and DATA for healthy connection B after all slow DATA.
+//  4. Requires B to establish and receive its exact DATA before any slow
+//     frontend is released or closed.
+//  5. Requires all slow connections to remain alive through B's progress.
+//
+// Each slow connection receives exactly one DATA packet, which its sole writer
+// dequeues before blocking. This proves only one-packet slack per connection;
+// another packet for any blocked frontend can still park the shared consumer.
+// Sustained negotiated isolation is a separate multi-packet contract.
+func TestOneOutstandingHTTPDataPacketPerSlowFrontendDoesNotDelayDialResponse(t *testing.T) {
+	for _, slowFrontendCount := range []int{2, 10} {
+		slowFrontendCount := slowFrontendCount
+		t.Run(fmt.Sprintf("slow_frontends=%d", slowFrontendCount), func(t *testing.T) {
+			runManySlowHTTPFrontendsDialResponseCase(t, slowFrontendCount)
+		})
+	}
+}
+
+func runManySlowHTTPFrontendsDialResponseCase(t *testing.T, slowFrontendCount int) {
+	const (
+		agentID    = "agent-1"
+		dialIDB    = int64(2001)
+		connectIDB = int64(3001)
+		payloadB   = "response for healthy connection B"
+	)
+
+	proxyServer := NewProxyServer(
+		"",
+		[]proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault},
+		1,
+		nil,
+		slowFrontendCount,
+	)
+	backend := &Backend{id: agentID}
+
+	slowHTTPs := make([]*blockingHTTPReadWriter, 0, slowFrontendCount)
+	connectIDs := make([]int64, 0, slowFrontendCount)
+	for i := 0; i < slowFrontendCount; i++ {
+		slowHTTP := newBlockingHTTPReadWriter()
+		connectID := int64(1001 + i)
+		connection := &ProxyClientConnection{
+			Mode:      ModeHTTPConnect,
+			HTTP:      slowHTTP,
+			CloseHTTP: func() error { slowHTTP.release(); return nil },
+			connected: make(chan struct{}),
+			connectID: connectID,
+			agentID:   agentID,
+			backend:   backend,
+		}
+		proxyServer.addEstablished(agentID, connectID, connection)
+		slowHTTPs = append(slowHTTPs, slowHTTP)
+		connectIDs = append(connectIDs, connectID)
+	}
+
+	recordingHTTP := newRecordingHTTPReadWriter()
+	connectionB := &ProxyClientConnection{
+		Mode:      ModeHTTPConnect,
+		HTTP:      recordingHTTP,
+		CloseHTTP: func() error { return nil },
+		connected: make(chan struct{}),
+		dialID:    dialIDB,
+		agentID:   agentID,
+		start:     time.Now(),
+		backend:   backend,
+	}
+	proxyServer.PendingDial.Add(dialIDB, connectionB)
+
+	// Writer 0's DATA is dequeued before the remaining packets are staged.
+	// Capacity N therefore holds exactly the remaining N-1 DATA packets plus
+	// B's final DIAL_RSP, so the producer cannot become the source of the stall.
+	recvCh := make(chan *client.Packet, slowFrontendCount)
+	consumerDone := make(chan struct{})
+	go func() {
+		defer close(consumerDone)
+		proxyServer.serveRecvBackend(backend, agentID, recvCh)
+	}()
+
+	releaseAll := func() {
+		for _, slowHTTP := range slowHTTPs {
+			slowHTTP.release()
+		}
+	}
+	t.Cleanup(func() {
+		releaseAll()
+		close(recvCh)
+		select {
+		case <-consumerDone:
+		case <-time.After(holTestSafetyTimeout):
+			t.Errorf("serveRecvBackend did not exit during test cleanup")
+		}
+	})
+
+	// Establish one actually blocked frontend before staging the remaining slow
+	// connections and B. The test does not require the implementation to start a
+	// Write for every other slow connection; only healthy B's progress matters.
+	recvCh <- dataPkt(connectIDs[0], []byte("response for slow connection 0"))
+	select {
+	case <-slowHTTPs[0].writeStarted:
+	case <-time.After(holTestSafetyTimeout):
+		t.Fatal("first slow connection did not enter the blocking HTTP Write")
+	}
+
+	for i := 1; i < slowFrontendCount; i++ {
+		recvCh <- dataPkt(connectIDs[i], []byte(fmt.Sprintf("response for slow connection %d", i)))
+	}
+	recvCh <- &client.Packet{
+		Type: client.PacketType_DIAL_RSP,
+		Payload: &client.Packet_DialResponse{
+			DialResponse: &client.DialResponse{
+				Random:    dialIDB,
+				ConnectID: connectIDB,
+			},
+		},
+	}
+
+	select {
+	case <-connectionB.connected:
+		// A DIAL_RSP-only priority mechanism is insufficient: after B establishes,
+		// exact DATA for B must also traverse the same loaded backend path.
+		recvCh <- dataPkt(connectIDB, []byte(payloadB))
+		select {
+		case got := <-recordingHTTP.writes:
+			if string(got) != payloadB {
+				t.Fatalf("connection B received payload %q, want %q", got, payloadB)
+			}
+		case <-time.After(holTestSafetyTimeout):
+			t.Fatal("connection B established but its DATA was delayed by the slow HTTP frontends")
+		}
+
+		// Each slow connection has only one DATA packet. The monotonic release
+		// signal catches a connection killed to make healthy B progress.
+		for i, slowHTTP := range slowHTTPs {
+			if slowHTTP.released() {
+				t.Fatalf("slow connection %d was released/closed to make healthy B progress", i)
+			}
+		}
+	case <-time.After(holTestSafetyTimeout):
+		// Release the slow frontends only after B failed to progress. If B then
+		// establishes, their blocked writes caused the failure without constraining
+		// how a correct implementation must dispatch writes.
+		releaseAll()
+		select {
+		case <-connectionB.connected:
+			t.Fatal("connection B established only after the slow HTTP frontends were released")
+		case <-time.After(holTestSafetyTimeout):
+			t.Fatal("connection B did not establish even after the slow HTTP frontends were released")
+		}
+	}
+}
+
+// TestSlowLegacyHTTPFrontendBackpressuresBackendReceiveChannel records the
+// compatibility behavior before response flow control is negotiated. It drives
+// readBackendToChannel -> recvCh -> serveRecvBackend, but not the outer Connect
+// RPC wrapper.
+//
+// For capacities 1 and 10, the test:
+//  1. Blocks established connection A in its HTTP socket Write.
+//  2. Delivers B's DIAL_RSP, then N+1 filler DATA packets for A so the backlog
+//     exceeds a capacity-N backend receive channel.
+//  3. Delivers terminal DATA for healthy B after the filler traffic.
+//  4. Confirms B establishes through the one-packet writer handoff, then the
+//     legacy stream backpressures and the FullRecvChannel gauge rises.
+//  5. Releases A and requires B's exact DATA to arrive and the shared
+//     receive-channel gauge to settle to zero.
+//
+// Capacity 1 is the minimal reproduction; capacity 10 matches the default
+// konnectivity-server backend Connect receive channel (agent -> server), not the
+// HTTP-CONNECT frontend path. Negotiated byte-window behavior will replace this
+// legacy head-of-line blocking contract in later tests.
+func TestSlowLegacyHTTPFrontendBackpressuresBackendReceiveChannel(t *testing.T) {
+	for _, capacity := range []int{1, 10} {
+		capacity := capacity
+		t.Run(fmt.Sprintf("capacity=%d", capacity), func(t *testing.T) {
+			runSlowHTTPFrontendSaturationCase(t, capacity)
+		})
+	}
+}
+
+func runSlowHTTPFrontendSaturationCase(t *testing.T, capacity int) {
+	const (
+		agentID    = "agent-1"
+		connectIDA = int64(1001)
+		connectIDB = int64(1002)
+		dialIDB    = int64(2002)
+		payloadB   = "terminal response for healthy connection B"
+	)
+
+	metrics.Metrics.Reset()
+	t.Cleanup(metrics.Metrics.Reset)
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	proxyServer := NewProxyServer(
+		"",
+		[]proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault},
+		1,
+		nil,
+		capacity,
+	)
+
+	dialRSPFor := func(random, connID int64) *client.Packet {
+		return &client.Packet{
+			Type: client.PacketType_DIAL_RSP,
+			Payload: &client.Packet_DialResponse{
+				DialResponse: &client.DialResponse{
+					Random:    random,
+					ConnectID: connID,
+				},
+			},
+		}
+	}
+
+	// Packets are released to the mock reader in stages, not preloaded, so the
+	// sustained saturation is provably caused by A's parked write rather than by
+	// the reader outrunning the consumer. The gate is opened only after A is
+	// confirmed blocked. gateOnce lets cleanup reopen it safely if the test
+	// fails before the main path does.
+	gateOpen := make(chan struct{})
+	var gateOnce sync.Once
+	openGate := func() { gateOnce.Do(func() { close(gateOpen) }) }
+
+	packets := make(chan *client.Packet)
+	fillerCount := capacity + 1
+
+	conn := mockAgentConn(ctrl, agentID, []string{})
+	conn.EXPECT().Recv().DoAndReturn(func() (*client.Packet, error) {
+		if pkt, ok := <-packets; ok {
+			return pkt, nil
+		}
+		return nil, io.EOF
+	}).AnyTimes()
+	backend, err := NewBackend(conn)
+	if err != nil {
+		t.Fatalf("NewBackend: %v", err)
+	}
+
+	slowHTTP := newBlockingHTTPReadWriter()
+	connectionA := &ProxyClientConnection{
+		Mode:      ModeHTTPConnect,
+		HTTP:      slowHTTP,
+		CloseHTTP: func() error { slowHTTP.release(); return nil },
+		connected: make(chan struct{}),
+		connectID: connectIDA,
+		agentID:   agentID,
+		backend:   backend,
+	}
+	proxyServer.addEstablished(agentID, connectIDA, connectionA)
+
+	recordingHTTP := newRecordingHTTPReadWriter()
+	connectionB := &ProxyClientConnection{
+		Mode:      ModeHTTPConnect,
+		HTTP:      recordingHTTP,
+		CloseHTTP: func() error { return nil },
+		connected: make(chan struct{}),
+		dialID:    dialIDB,
+		agentID:   agentID,
+		start:     time.Now(),
+		backend:   backend,
+	}
+	proxyServer.PendingDial.Add(dialIDB, connectionB)
+
+	recvCh := make(chan *client.Packet, capacity)
+	stopCh := make(chan error, 1)
+	consumerDone := make(chan struct{})
+	readerDone := make(chan struct{})
+	var closeRecvOnce sync.Once
+	closeRecv := func() { closeRecvOnce.Do(func() { close(recvCh) }) }
+	go func() {
+		defer close(consumerDone)
+		proxyServer.serveRecvBackend(backend, agentID, recvCh)
+	}()
+	go func() {
+		defer close(readerDone)
+		proxyServer.readBackendToChannel(backend, recvCh, stopCh)
+	}()
+
+	// The feeder owns the packets channel: it delivers A's DATA, then (after the
+	// gate opens) B's DIAL_RSP, N+1 A fillers, and finally DATA for healthy B, then
+	// closes packets so the reader sees EOF. allPacketsPulled reports that the
+	// mock stream yielded every packet; it does NOT by itself prove those
+	// packets were inserted into recvCh or consumed. Delivery to B is the
+	// end-to-end progress proof.
+	allPacketsPulled := make(chan struct{})
+	go func() {
+		defer close(allPacketsPulled)
+		packets <- dataPkt(connectIDA, []byte("response for connection A"))
+		<-gateOpen
+		packets <- dialRSPFor(dialIDB, connectIDB)
+		for i := 0; i < fillerCount; i++ {
+			packets <- dataPkt(connectIDA, []byte("filler to saturate recvCh"))
+		}
+		packets <- dataPkt(connectIDB, []byte(payloadB))
+		close(packets)
+	}()
+
+	t.Cleanup(func() {
+		openGate()         // unblock the feeder if we failed before opening it.
+		slowHTTP.release() // unblock A so the consumer and reader can drain.
+		select {
+		case <-allPacketsPulled:
+		case <-time.After(holTestSafetyTimeout):
+			t.Errorf("feeder did not finish delivering packets during cleanup")
+		}
+		select {
+		case <-readerDone:
+			// Only safe to close recvCh once the reader has stopped sending.
+			closeRecv() // mirrors production defer; lets the consumer loop end.
+			select {
+			case <-consumerDone:
+			case <-time.After(holTestSafetyTimeout):
+				t.Errorf("serveRecvBackend did not exit during test cleanup")
+			}
+		case <-time.After(holTestSafetyTimeout):
+			// Do not close recvCh while readBackendToChannel may still send to
+			// it; that would panic and mask the real failure.
+			t.Errorf("readBackendToChannel did not exit during test cleanup; leaving recvCh open to avoid send-on-closed")
+		}
+	})
+
+	// Wait until A is provably blocked inside its HTTP Write, then open the gate
+	// so any saturation is attributable to A.
+	select {
+	case <-slowHTTP.writeStarted:
+	case <-time.After(holTestSafetyTimeout):
+		t.Fatal("connection A did not enter the blocking HTTP Write")
+	}
+	openGate()
+
+	// B's DIAL_RSP precedes the filler DATA, so the first connection-owned
+	// handoff lets B establish before legacy DATA backpressure takes effect.
+	select {
+	case <-connectionB.connected:
+	case <-time.After(holTestSafetyTimeout):
+		t.Fatal("connection B did not establish before legacy DATA backpressure")
+	}
+
+	saturated := false
+	for i := 0; i < 100; i++ {
+		if promtest.ToFloat64(metrics.Metrics.FullRecvChannel(metrics.Connect)) >= 1 {
+			saturated = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !saturated {
+		t.Fatal("FullRecvChannel gauge did not rise under legacy DATA backpressure")
+	}
+	if slowHTTP.released() {
+		t.Fatal("slow legacy connection was closed instead of backpressuring")
+	}
+
+	select {
+	case got := <-recordingHTTP.writes:
+		t.Fatalf("connection B received DATA %q before legacy backpressure was released", got)
+	default:
+	}
+
+	slowHTTP.release()
+	select {
+	case got := <-recordingHTTP.writes:
+		if string(got) != payloadB {
+			t.Fatalf("connection B received payload %q, want %q", got, payloadB)
+		}
+	case <-time.After(holTestSafetyTimeout):
+		t.Fatal("connection B DATA did not progress after legacy backpressure was released")
+	}
+	select {
+	case <-allPacketsPulled:
+	case <-time.After(holTestSafetyTimeout):
+		t.Fatal("reader did not pull all packets after legacy backpressure was released")
+	}
+	select {
+	case <-readerDone:
+	case <-time.After(holTestSafetyTimeout):
+		t.Fatal("backend reader did not exit after draining legacy traffic")
+	}
+	closeRecv()
+	select {
+	case <-consumerDone:
+	case <-time.After(holTestSafetyTimeout):
+		t.Fatal("backend consumer did not exit after draining legacy traffic")
+	}
+
+	settled := false
+	for i := 0; i < 100; i++ {
+		if promtest.ToFloat64(metrics.Metrics.FullRecvChannel(metrics.Connect)) == 0 {
+			settled = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !settled {
+		t.Errorf("FullRecvChannel gauge did not return to 0; backend ingress is still stalled")
 	}
 }
