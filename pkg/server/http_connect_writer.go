@@ -47,6 +47,7 @@ type httpConnectAbortReason string
 const (
 	httpConnectAbortBackendShutdown httpConnectAbortReason = "backend_shutdown"
 	httpConnectAbortDialClosed      httpConnectAbortReason = "dial_closed"
+	httpConnectAbortFeatureMismatch httpConnectAbortReason = "flow_control_feature_mismatch"
 	httpConnectAbortFrontendClose   httpConnectAbortReason = "frontend_close"
 	httpConnectAbortSetupRace       httpConnectAbortReason = "setup_race"
 	httpConnectAbortWriteFailure    httpConnectAbortReason = "write_failure"

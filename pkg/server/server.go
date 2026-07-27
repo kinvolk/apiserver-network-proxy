@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	runpprof "runtime/pprof"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -184,6 +185,15 @@ func (c *ProxyClientConnection) send(pkt *client.Packet) error {
 		return fmt.Errorf("HTTP-CONNECT packet %v must be routed through its connection writer", pkt.Type)
 	}
 	return fmt.Errorf("attempt to send via unrecognized connection mode %q", c.Mode)
+}
+
+func flowControlFeaturesWereOffered(accepted, offered []client.FlowControlFeature) bool {
+	for _, feature := range accepted {
+		if !slices.Contains(offered, feature) {
+			return false
+		}
+	}
+	return true
 }
 
 func NewPendingDialManager() *PendingDialManager {
@@ -1073,6 +1083,17 @@ func (s *ProxyServer) serveRecvBackend(backend *Backend, agentID string, recvCh 
 			}
 
 			frontend.setHTTPConnectionDetails(agentID, resp.ConnectID)
+			if !flowControlFeaturesWereOffered(resp.GetAcceptedFlowControlFeatures(), frontend.offeredFlowControlFeatures) {
+				klog.ErrorS(nil, "DIAL_RSP accepted unoffered flow-control feature",
+					"dialID", resp.Random,
+					"agentID", agentID,
+					"connectionID", resp.ConnectID,
+					"offeredFlowControlFeatures", frontend.offeredFlowControlFeatures,
+					"acceptedFlowControlFeatures", resp.GetAcceptedFlowControlFeatures(),
+				)
+				frontend.abortHTTP(s, httpConnectAbortFeatureMismatch)
+				break
+			}
 			writer, attached := frontend.configuredHTTPWriter(s, true)
 			if !attached {
 				// Teardown won before writer attachment. The backend has still

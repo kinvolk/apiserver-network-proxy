@@ -22,6 +22,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 
@@ -117,6 +118,10 @@ func (t *Tunnel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		backend:             backend,
 		dialID:              random,
 		agentID:             initialAgentID,
+
+		offeredFlowControlFeatures: slices.Clone(
+			dialRequest.GetDialRequest().GetOfferedFlowControlFeatures(),
+		),
 	}
 	t.Server.PendingDial.Add(random, connection)
 
