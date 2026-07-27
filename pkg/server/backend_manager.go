@@ -58,6 +58,12 @@ type Backend struct {
 	// this backend stream is published.
 	enableHTTPConnectFlowControl bool
 
+	// httpConnectResponseMode is latched by the first valid successful HTTP-CONNECT
+	// DIAL_RSP on this backend stream. It records stream policy and is not rolled
+	// back if frontend setup later fails.
+	httpConnectResponseModeMu sync.Mutex
+	httpConnectResponseMode   httpConnectResponseMode
+
 	// draining indicates if this backend is draining and should not accept new connections
 	draining atomic.Bool
 }
@@ -81,6 +87,16 @@ func (b *Backend) Retire() {
 
 func (b *Backend) Done() <-chan struct{} {
 	return b.done
+}
+
+func (b *Backend) latchHTTPConnectResponseMode(selected httpConnectResponseMode) (httpConnectResponseMode, bool) {
+	b.httpConnectResponseModeMu.Lock()
+	defer b.httpConnectResponseModeMu.Unlock()
+
+	if b.httpConnectResponseMode == httpConnectResponseModeUnset {
+		b.httpConnectResponseMode = selected
+	}
+	return b.httpConnectResponseMode, b.httpConnectResponseMode == selected
 }
 
 func (b *Backend) Send(p *client.Packet) error {

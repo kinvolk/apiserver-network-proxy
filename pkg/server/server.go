@@ -215,6 +215,13 @@ func hasDuplicateFlowControlFeature(features []client.FlowControlFeature) bool {
 	return false
 }
 
+func responseModeForAcceptedFlowControlFeatures(features []client.FlowControlFeature) httpConnectResponseMode {
+	if slices.Contains(features, client.FlowControlFeature_AGENT_TO_SERVER_BYTE_WINDOW_V1) {
+		return httpConnectResponseModeAgentToServerByteWindowV1
+	}
+	return httpConnectResponseModeLegacy
+}
+
 func NewPendingDialManager() *PendingDialManager {
 	return &PendingDialManager{
 		pendingDial: make(map[int64]*ProxyClientConnection),
@@ -1115,6 +1122,21 @@ func (s *ProxyServer) serveRecvBackend(backend *Backend, agentID string, recvCh 
 				frontend.abortHTTP(s, httpConnectAbortFeatureMismatch)
 				break
 			}
+
+			selectedResponseMode := responseModeForAcceptedFlowControlFeatures(acceptedFlowControlFeatures)
+			if streamResponseMode, ok := backend.latchHTTPConnectResponseMode(selectedResponseMode); !ok {
+				klog.ErrorS(nil, "DIAL_RSP changes HTTP CONNECT response mode on backend stream",
+					"dialID", resp.Random,
+					"agentID", agentID,
+					"connectionID", resp.ConnectID,
+					"streamResponseMode", streamResponseMode,
+					"selectedResponseMode", selectedResponseMode,
+				)
+				frontend.abortHTTP(s, httpConnectAbortFeatureMismatch)
+				break
+			}
+			frontend.httpConnectResponseMode = selectedResponseMode
+
 			writer, attached := frontend.configuredHTTPWriter(s, true)
 			if !attached {
 				// Teardown won before writer attachment. The backend has still
