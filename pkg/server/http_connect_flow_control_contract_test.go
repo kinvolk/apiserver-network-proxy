@@ -17,6 +17,7 @@ limitations under the License.
 package server
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -125,4 +126,65 @@ func httpConnectFlowControlDialRequest(t *testing.T, enabled bool) *client.DialR
 	}
 
 	return dialRequest
+}
+
+// TestHTTPConnectRejectsAcceptedResponseFlowControlWithoutOffer starts at the
+// PendingDial handoff with no feature offer recorded for the dial. The positive
+// DIAL_RSP is therefore deliberately malformed: the server must reject it
+// before connection publication or a successful CONNECT response.
+func TestHTTPConnectRejectsAcceptedResponseFlowControlWithoutOffer(t *testing.T) {
+	const (
+		agentID   = "unoffered-flow-control-agent"
+		dialID    = int64(6101)
+		connectID = int64(6102)
+	)
+
+	proxyServer := newWriterTestServer()
+	backend, _ := newWriterTestBackend(context.Background(), agentID)
+	frontendHTTP := newWriterTestImmediateHTTP()
+	connected := make(chan struct{})
+	connection := &ProxyClientConnection{
+		Mode:                ModeHTTPConnect,
+		HTTP:                frontendHTTP,
+		CloseHTTP:           frontendHTTP.close,
+		connected:           connected,
+		closed:              make(chan struct{}),
+		dialID:              dialID,
+		start:               time.Now(),
+		backend:             backend,
+		agentID:             agentID,
+		httpInitialResponse: []byte(httpConnectSuccessResponse),
+	}
+	proxyServer.PendingDial.Add(dialID, connection)
+	consumer := startWriterTestBackendConsumer(t, proxyServer, backend, agentID, 1)
+
+	consumer.recvCh <- &client.Packet{
+		Type: client.PacketType_DIAL_RSP,
+		Payload: &client.Packet_DialResponse{
+			DialResponse: &client.DialResponse{
+				Random:    dialID,
+				ConnectID: connectID,
+				AcceptedFlowControlFeatures: []client.FlowControlFeature{
+					client.FlowControlFeature_AGENT_TO_SERVER_BYTE_WINDOW_V1,
+				},
+			},
+		},
+	}
+
+	select {
+	case <-connected:
+		written, _, _ := frontendHTTP.snapshot()
+		t.Fatalf("accepted-but-not-offered DIAL_RSP established the tunnel and wrote %q", written)
+	case <-frontendHTTP.closeCh:
+	case <-time.After(writerTestSafetyTimeout):
+		t.Fatal("server did not finish accepted-but-not-offered DIAL_RSP handling")
+	}
+
+	written, _, _ := frontendHTTP.snapshot()
+	if bytes.HasPrefix(written, []byte(httpConnectSuccessResponse)) {
+		t.Fatalf("accepted-but-not-offered DIAL_RSP wrote successful CONNECT response %q", written)
+	}
+	if _, err := proxyServer.getFrontend(agentID, connectID); err == nil {
+		t.Fatal("accepted-but-not-offered DIAL_RSP published an established connection")
+	}
 }
