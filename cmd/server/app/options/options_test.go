@@ -70,6 +70,31 @@ func TestDefaultServerOptions(t *testing.T) {
 
 }
 
+func TestHTTPConnectFlowControlFlag(t *testing.T) {
+	const (
+		name      = "enable-http-connect-flow-control"
+		wantUsage = "Enable negotiated HTTP CONNECT flow control. Currently applies only to agent-to-server response DATA; server-to-agent request DATA remains legacy."
+	)
+
+	flags := NewProxyRunOptions().Flags()
+	flag := flags.Lookup(name)
+	if flag == nil {
+		t.Fatalf("server flag %q is not registered", name)
+	}
+	if got, want := flag.DefValue, "false"; got != want {
+		t.Fatalf("server flag %q default = %q, want %q", name, got, want)
+	}
+	if got := flag.Usage; got != wantUsage {
+		t.Fatalf("server flag %q usage = %q, want %q", name, got, wantUsage)
+	}
+	if err := flags.Set(name, "true"); err != nil {
+		t.Fatalf("set server flag %q: %v", name, err)
+	}
+	if got, want := flag.Value.String(), "true"; got != want {
+		t.Fatalf("server flag %q value = %q, want %q", name, got, want)
+	}
+}
+
 func assertDefaultValue(t *testing.T, fieldName string, actual, expected interface{}) {
 	t.Helper()
 	assert.IsType(t, expected, actual, "For field %s, got the wrong type.", fieldName)

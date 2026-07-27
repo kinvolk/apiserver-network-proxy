@@ -263,6 +263,10 @@ type ProxyServer struct {
 	xfrChannelSize  int
 
 	backendDialTimeout time.Duration
+
+	// enableHTTPConnectFlowControl is startup policy. Backend streams snapshot
+	// it before publication.
+	enableHTTPConnectFlowControl bool
 }
 
 // AgentTokenAuthenticationOptions contains list of parameters required for agent token based authentication
@@ -539,6 +543,12 @@ func NewProxyServer(serverID string, proxyStrategies []proxystrategies.ProxyStra
 
 func (s *ProxyServer) SetBackendDialTimeout(timeout time.Duration) {
 	s.backendDialTimeout = timeout
+}
+
+// SetHTTPConnectFlowControlEnabled configures startup policy and must be called
+// before backend streams are accepted.
+func (s *ProxyServer) SetHTTPConnectFlowControlEnabled(enabled bool) {
+	s.enableHTTPConnectFlowControl = enabled
 }
 
 // Proxy handles incoming streams from gRPC frontend.
