@@ -45,6 +45,8 @@ type GrpcProxyAgentOptions struct {
 	ProxyServerHost string
 	ProxyServerPort int
 	AlpnProtos      []string
+	// Enables negotiated HTTP CONNECT flow control.
+	EnableHTTPConnectFlowControl bool
 
 	// Bind address for the health connections.
 	HealthServerHost string
@@ -122,6 +124,7 @@ func (o *GrpcProxyAgentOptions) Flags() *pflag.FlagSet {
 	flags.StringVar(&o.ProxyServerHost, "proxy-server-host", o.ProxyServerHost, "The hostname to use to connect to the proxy-server.")
 	flags.IntVar(&o.ProxyServerPort, "proxy-server-port", o.ProxyServerPort, "The port the proxy server is listening on.")
 	flags.StringSliceVar(&o.AlpnProtos, "alpn-proto", o.AlpnProtos, "Additional ALPN protocols to be presented when connecting to the server. Useful to distinguish between network proxy and apiserver connections that share the same destination address.")
+	flags.BoolVar(&o.EnableHTTPConnectFlowControl, "enable-http-connect-flow-control", o.EnableHTTPConnectFlowControl, "Enable negotiated HTTP CONNECT flow control. Currently applies only to agent-to-server response DATA; server-to-agent request DATA remains legacy.")
 	flags.StringVar(&o.HealthServerHost, "health-server-host", o.HealthServerHost, "The host address to listen on, without port.")
 	flags.IntVar(&o.HealthServerPort, "health-server-port", o.HealthServerPort, "The port the health server is listening on.")
 	flags.IntVar(&o.AdminServerPort, "admin-server-port", o.AdminServerPort, "The port the admin server is listening on.")
@@ -154,6 +157,7 @@ func (o *GrpcProxyAgentOptions) Print() {
 	klog.V(1).Infof("ProxyServerHost set to %q.\n", o.ProxyServerHost)
 	klog.V(1).Infof("ProxyServerPort set to %d.\n", o.ProxyServerPort)
 	klog.V(1).Infof("ALPNProtos set to %+s.\n", o.AlpnProtos)
+	klog.V(1).Infof("EnableHTTPConnectFlowControl set to %v.\n", o.EnableHTTPConnectFlowControl)
 	klog.V(1).Infof("HealthServerHost set to %s\n", o.HealthServerHost)
 	klog.V(1).Infof("HealthServerPort set to %d.\n", o.HealthServerPort)
 	klog.V(1).Infof("Admin bind address set to %q.\n", o.AdminBindAddress)

@@ -54,6 +54,10 @@ type Backend struct {
 
 	done chan struct{}
 
+	// enableHTTPConnectFlowControl is the immutable offer policy captured when
+	// this backend stream is published.
+	enableHTTPConnectFlowControl bool
+
 	// draining indicates if this backend is draining and should not accept new connections
 	draining atomic.Bool
 }

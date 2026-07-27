@@ -370,6 +370,7 @@ func (s *ProxyServer) startPendingDialTimeout(random int64, backend *Backend, fr
 }
 
 func (s *ProxyServer) addBackend(backend *Backend) {
+	backend.enableHTTPConnectFlowControl = s.enableHTTPConnectFlowControl
 	// TODO: refactor BackendStorage to acquire lock once, not up to 3 times.
 	for _, bm := range s.BackendManagers {
 		bm.AddBackend(backend)

@@ -43,6 +43,8 @@ type ProxyRunOptions struct {
 	ClusterCaCert string
 	// Flag to switch between gRPC and HTTP Connect
 	Mode string
+	// Enables negotiated HTTP CONNECT flow control.
+	EnableHTTPConnectFlowControl bool
 	// Location for use by the "unix" network. Setting enables UDS for server connections.
 	UdsName string
 	// If file UdsName already exists, delete the file before listen on that UDS file.
@@ -135,6 +137,7 @@ func (o *ProxyRunOptions) Flags() *pflag.FlagSet {
 	flags.StringVar(&o.ClusterKey, "cluster-key", o.ClusterKey, "If non-empty secure communication with this key.")
 	flags.StringVar(&o.ClusterCaCert, "cluster-ca-cert", o.ClusterCaCert, "If non-empty the CA we use to validate Agent clients.")
 	flags.StringVar(&o.Mode, "mode", o.Mode, "mode can be either 'grpc' or 'http-connect'.")
+	flags.BoolVar(&o.EnableHTTPConnectFlowControl, "enable-http-connect-flow-control", o.EnableHTTPConnectFlowControl, "Enable negotiated HTTP CONNECT flow control. Currently applies only to agent-to-server response DATA; server-to-agent request DATA remains legacy.")
 	flags.StringVar(&o.UdsName, "uds-name", o.UdsName, "uds-name should be empty for TCP traffic. For UDS set to its name.")
 	flags.BoolVar(&o.DeleteUDSFile, "delete-existing-uds-file", o.DeleteUDSFile, "If true and if file UdsName already exists, delete the file before listen on that UDS file. Default is true.")
 	flags.IntVar(&o.ServerPort, "server-port", o.ServerPort, "Port we listen for server connections on. Set to 0 for UDS.")
@@ -181,6 +184,7 @@ func (o *ProxyRunOptions) Print() {
 	klog.V(1).Infof("ClusterKey set to %q.\n", o.ClusterKey)
 	klog.V(1).Infof("ClusterCACert set to %q.\n", o.ClusterCaCert)
 	klog.V(1).Infof("Mode set to %q.\n", o.Mode)
+	klog.V(1).Infof("EnableHTTPConnectFlowControl set to %v.\n", o.EnableHTTPConnectFlowControl)
 	klog.V(1).Infof("UDSName set to %q.\n", o.UdsName)
 	klog.V(1).Infof("DeleteUDSFile set to %v.\n", o.DeleteUDSFile)
 	klog.V(1).Infof("Server port set to %d.\n", o.ServerPort)

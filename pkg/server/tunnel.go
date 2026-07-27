@@ -97,6 +97,11 @@ func (t *Tunnel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = conn.Close()
 		return
 	}
+	if backend.enableHTTPConnectFlowControl {
+		dialRequest.GetDialRequest().OfferedFlowControlFeatures = []client.FlowControlFeature{
+			client.FlowControlFeature_AGENT_TO_SERVER_BYTE_WINDOW_V1,
+		}
+	}
 
 	closed := make(chan struct{})
 	connected := make(chan struct{})
