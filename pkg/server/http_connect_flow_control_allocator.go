@@ -136,6 +136,8 @@ func (c *ProxyClientConnection) startHTTPConnectResponseFlowControlAdmission(
 			flowControlDone = state.done
 		} else {
 			state.reservation = reservation
+			// Publish provisional ownership only. Establishment still owes the
+			// revalidation documented on httpConnectResponseFlowControlAdmissionState.
 			close(state.reservationReady)
 		}
 	default:
@@ -181,6 +183,8 @@ func (c *ProxyClientConnection) receiveHTTPConnectResponseFlowControlReservation
 			return
 		}
 		state.reservation = reservation
+		// Publish provisional ownership only. Establishment still owes the
+		// revalidation documented on httpConnectResponseFlowControlAdmissionState.
 		close(state.reservationReady)
 		c.httpMu.Unlock()
 	case <-state.stopReceiver:

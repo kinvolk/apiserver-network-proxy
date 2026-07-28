@@ -637,6 +637,36 @@ func TestHTTPConnectResponseFlowControlAdmissionRejectsDuplicateStart(t *testing
 	default:
 		t.Fatal("original admission did not converge after duplicate rejection and abort")
 	}
+
+	// Vacating the connection-owned slot at termination must not re-arm
+	// admission. Hold the only reservation so the fresh admission remains
+	// queued and caller-cancellable when the terminal connection rejects it.
+	postTerminalHolder := requireHTTPConnectFlowControlReservation(
+		t,
+		requireHTTPConnectFlowControlAdmission(t, allocator, httpConnectFlowControlAdmissionGranted),
+	)
+	postTerminalAdmission := requireHTTPConnectFlowControlAdmission(t, allocator, httpConnectFlowControlAdmissionQueued)
+	postTerminalReady, postTerminalDone, postTerminalStarted := connection.startHTTPConnectResponseFlowControlAdmission(postTerminalAdmission)
+	connection.httpMu.Lock()
+	stateAfterPostTerminalStart := connection.httpResponseFlowControlAdmission
+	connection.httpMu.Unlock()
+
+	callerCancelledPostTerminalAdmission := postTerminalAdmission.cancel()
+	postTerminalHolder.release()
+	assertHTTPConnectFlowControlAllocatorUsage(t, allocator, 0, 0)
+
+	if postTerminalStarted {
+		t.Fatal("post-terminal admission start = true, want false")
+	}
+	if postTerminalReady != nil || postTerminalDone != nil {
+		t.Fatalf("rejected post-terminal admission signals = (%v, %v), want (nil, nil)", postTerminalReady, postTerminalDone)
+	}
+	if stateAfterPostTerminalStart != nil {
+		t.Fatal("post-terminal admission start repopulated the connection-owned slot")
+	}
+	if !callerCancelledPostTerminalAdmission {
+		t.Fatal("rejected post-terminal admission did not remain caller-owned")
+	}
 }
 
 // This test races the real DIAL_RSP routing path against the Tunnel teardown
