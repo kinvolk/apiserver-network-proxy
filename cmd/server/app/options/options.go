@@ -143,6 +143,10 @@ func (o *ProxyRunOptions) Flags() *pflag.FlagSet {
 	flags.StringVar(&o.ClusterCaCert, "cluster-ca-cert", o.ClusterCaCert, "If non-empty the CA we use to validate Agent clients.")
 	flags.StringVar(&o.Mode, "mode", o.Mode, "mode can be either 'grpc' or 'http-connect'.")
 	flags.BoolVar(&o.EnableHTTPConnectFlowControl, "enable-http-connect-flow-control", o.EnableHTTPConnectFlowControl, "Enable negotiated HTTP CONNECT flow control. Currently applies only to agent-to-server response DATA; server-to-agent request DATA remains legacy.")
+	flags.Int64Var(&o.HTTPConnectFlowControlWindowSize, "http-connect-flow-control-window-size", o.HTTPConnectFlowControlWindowSize, "Bytes reserved and advertised for each admitted HTTP CONNECT flow-control connection. Currently applies only to agent-to-server response DATA; server-to-agent request DATA remains legacy.")
+	flags.Int64Var(&o.HTTPConnectFlowControlPoolSize, "http-connect-flow-control-pool-size", o.HTTPConnectFlowControlPoolSize, "Maximum aggregate HTTP CONNECT flow-control capacity reserved by this process, in bytes. Currently applies only to agent-to-server response DATA; server-to-agent request DATA remains legacy.")
+	flags.IntVar(&o.HTTPConnectFlowControlMaxPendingAdmissions, "http-connect-flow-control-max-pending-admissions", o.HTTPConnectFlowControlMaxPendingAdmissions, "Maximum negotiated HTTP CONNECT connections waiting for flow-control admission before HTTP 200. Set to 0 to disable waiting. Currently applies only to agent-to-server response DATA; server-to-agent request DATA remains legacy.")
+	flags.DurationVar(&o.HTTPConnectFlowControlAdmissionTimeout, "http-connect-flow-control-admission-timeout", o.HTTPConnectFlowControlAdmissionTimeout, "Maximum time a negotiated HTTP CONNECT connection waits for flow-control admission before HTTP 200. Currently applies only to agent-to-server response DATA; server-to-agent request DATA remains legacy.")
 	flags.StringVar(&o.UdsName, "uds-name", o.UdsName, "uds-name should be empty for TCP traffic. For UDS set to its name.")
 	flags.BoolVar(&o.DeleteUDSFile, "delete-existing-uds-file", o.DeleteUDSFile, "If true and if file UdsName already exists, delete the file before listen on that UDS file. Default is true.")
 	flags.IntVar(&o.ServerPort, "server-port", o.ServerPort, "Port we listen for server connections on. Set to 0 for UDS.")
@@ -190,6 +194,10 @@ func (o *ProxyRunOptions) Print() {
 	klog.V(1).Infof("ClusterCACert set to %q.\n", o.ClusterCaCert)
 	klog.V(1).Infof("Mode set to %q.\n", o.Mode)
 	klog.V(1).Infof("EnableHTTPConnectFlowControl set to %v.\n", o.EnableHTTPConnectFlowControl)
+	klog.V(1).Infof("HTTPConnectFlowControlWindowSize set to %d.\n", o.HTTPConnectFlowControlWindowSize)
+	klog.V(1).Infof("HTTPConnectFlowControlPoolSize set to %d.\n", o.HTTPConnectFlowControlPoolSize)
+	klog.V(1).Infof("HTTPConnectFlowControlMaxPendingAdmissions set to %d.\n", o.HTTPConnectFlowControlMaxPendingAdmissions)
+	klog.V(1).Infof("HTTPConnectFlowControlAdmissionTimeout set to %v.\n", o.HTTPConnectFlowControlAdmissionTimeout)
 	klog.V(1).Infof("UDSName set to %q.\n", o.UdsName)
 	klog.V(1).Infof("DeleteUDSFile set to %v.\n", o.DeleteUDSFile)
 	klog.V(1).Infof("Server port set to %d.\n", o.ServerPort)
@@ -384,6 +392,21 @@ func (o *ProxyRunOptions) Validate() error {
 	if o.BackendDialTimeout < 0 {
 		return fmt.Errorf("backend-dial-timeout must be >= 0, got %v", o.BackendDialTimeout)
 	}
+	if o.HTTPConnectFlowControlWindowSize <= 0 {
+		return fmt.Errorf("http-connect-flow-control-window-size must be greater than 0, got %d", o.HTTPConnectFlowControlWindowSize)
+	}
+	if o.HTTPConnectFlowControlPoolSize <= 0 {
+		return fmt.Errorf("http-connect-flow-control-pool-size must be greater than 0, got %d", o.HTTPConnectFlowControlPoolSize)
+	}
+	if o.HTTPConnectFlowControlPoolSize < o.HTTPConnectFlowControlWindowSize {
+		return fmt.Errorf("http-connect-flow-control-pool-size (%d) must be at least http-connect-flow-control-window-size (%d)", o.HTTPConnectFlowControlPoolSize, o.HTTPConnectFlowControlWindowSize)
+	}
+	if o.HTTPConnectFlowControlMaxPendingAdmissions < 0 {
+		return fmt.Errorf("http-connect-flow-control-max-pending-admissions must be non-negative, got %d", o.HTTPConnectFlowControlMaxPendingAdmissions)
+	}
+	if o.HTTPConnectFlowControlMaxPendingAdmissions > 0 && o.HTTPConnectFlowControlAdmissionTimeout <= 0 {
+		return fmt.Errorf("http-connect-flow-control-admission-timeout must be greater than 0 when http-connect-flow-control-max-pending-admissions is non-zero, got %v", o.HTTPConnectFlowControlAdmissionTimeout)
+	}
 
 	o.NeedsKubernetesClient = usingServiceAccountAuth || o.EnableLeaseController
 
@@ -432,6 +455,10 @@ func NewProxyRunOptions() *ProxyRunOptions {
 		GracefulShutdownTimeout:   0,
 		BackendDialTimeout:        0,
 	}
+	o.HTTPConnectFlowControlWindowSize = 64 << 10
+	o.HTTPConnectFlowControlPoolSize = 128 << 20
+	o.HTTPConnectFlowControlMaxPendingAdmissions = 256
+	o.HTTPConnectFlowControlAdmissionTimeout = time.Second
 	return &o
 }
 

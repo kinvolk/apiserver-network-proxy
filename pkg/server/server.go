@@ -89,7 +89,13 @@ const (
 	ModeHTTPConnect = "http-connect"
 )
 
-const defaultBackendDialTimeout = 0
+const (
+	defaultBackendDialTimeout                               = 0
+	defaultHTTPConnectFlowControlWindowSize           int64 = 64 << 10
+	defaultHTTPConnectFlowControlPoolSize             int64 = 128 << 20
+	defaultHTTPConnectFlowControlMaxPendingAdmissions       = 256
+	defaultHTTPConnectFlowControlAdmissionTimeout           = time.Second
+)
 
 var errBackendDialTimeout = errors.New("timed out waiting for backend dial")
 
@@ -571,7 +577,7 @@ func NewProxyServer(serverID string, proxyStrategies []proxystrategies.ProxyStra
 		}
 	}
 
-	return &ProxyServer{
+	s := &ProxyServer{
 		established:                make(map[string](map[int64]*ProxyClientConnection)),
 		PendingDial:                NewPendingDialManager(),
 		serverID:                   serverID,
@@ -584,6 +590,11 @@ func NewProxyServer(serverID string, proxyStrategies []proxystrategies.ProxyStra
 		xfrChannelSize:     channelSize,
 		backendDialTimeout: defaultBackendDialTimeout,
 	}
+	s.httpConnectFlowControlWindowSize = defaultHTTPConnectFlowControlWindowSize
+	s.httpConnectFlowControlPoolSize = defaultHTTPConnectFlowControlPoolSize
+	s.httpConnectFlowControlMaxPendingAdmissions = defaultHTTPConnectFlowControlMaxPendingAdmissions
+	s.httpConnectFlowControlAdmissionTimeout = defaultHTTPConnectFlowControlAdmissionTimeout
+	return s
 }
 
 func (s *ProxyServer) SetBackendDialTimeout(timeout time.Duration) {
@@ -599,6 +610,10 @@ func (s *ProxyServer) SetHTTPConnectFlowControlEnabled(enabled bool) {
 // SetHTTPConnectFlowControlConfig configures startup tuning and must be
 // called before backend streams are accepted.
 func (s *ProxyServer) SetHTTPConnectFlowControlConfig(windowSize, poolSize int64, maxPendingAdmissions int, admissionTimeout time.Duration) {
+	s.httpConnectFlowControlWindowSize = windowSize
+	s.httpConnectFlowControlPoolSize = poolSize
+	s.httpConnectFlowControlMaxPendingAdmissions = maxPendingAdmissions
+	s.httpConnectFlowControlAdmissionTimeout = admissionTimeout
 }
 
 // Proxy handles incoming streams from gRPC frontend.

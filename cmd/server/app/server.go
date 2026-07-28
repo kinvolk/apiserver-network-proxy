@@ -97,7 +97,14 @@ type Proxy struct {
 
 type StopFunc func(context.Context) error
 
-func logHTTPConnectFlowControlConfig(_ func(string, ...interface{}), _ *options.ProxyRunOptions) {
+func logHTTPConnectFlowControlConfig(log func(string, ...interface{}), o *options.ProxyRunOptions) {
+	log("Configured HTTP CONNECT response flow control",
+		"windowSizeBytes", o.HTTPConnectFlowControlWindowSize,
+		"poolSizeBytes", o.HTTPConnectFlowControlPoolSize,
+		"maxReservations", o.HTTPConnectFlowControlPoolSize/o.HTTPConnectFlowControlWindowSize,
+		"maxPendingAdmissions", o.HTTPConnectFlowControlMaxPendingAdmissions,
+		"admissionTimeout", o.HTTPConnectFlowControlAdmissionTimeout,
+	)
 }
 
 func (p *Proxy) Run(o *options.ProxyRunOptions, stopCh <-chan struct{}) error {
@@ -105,6 +112,7 @@ func (p *Proxy) Run(o *options.ProxyRunOptions, stopCh <-chan struct{}) error {
 	if err := o.Validate(); err != nil {
 		return fmt.Errorf("failed to validate server options with %v", err)
 	}
+	logHTTPConnectFlowControlConfig(klog.InfoS, o)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -145,6 +153,12 @@ func (p *Proxy) Run(o *options.ProxyRunOptions, stopCh <-chan struct{}) error {
 	p.server = server.NewProxyServer(o.ServerID, ps, o.ServerCount, authOpt, o.XfrChannelSize)
 	p.server.SetBackendDialTimeout(o.BackendDialTimeout)
 	p.server.SetHTTPConnectFlowControlEnabled(o.EnableHTTPConnectFlowControl)
+	p.server.SetHTTPConnectFlowControlConfig(
+		o.HTTPConnectFlowControlWindowSize,
+		o.HTTPConnectFlowControlPoolSize,
+		o.HTTPConnectFlowControlMaxPendingAdmissions,
+		o.HTTPConnectFlowControlAdmissionTimeout,
+	)
 
 	frontendStop, err := p.runFrontendServer(ctx, o, p.server)
 	if err != nil {
