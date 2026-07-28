@@ -101,7 +101,7 @@ func (a *httpConnectFlowControlAdmission) reservationReady() <-chan *httpConnect
 // this ownership transfer.
 func (c *ProxyClientConnection) startHTTPConnectResponseFlowControlAdmission(
 	admission *httpConnectFlowControlAdmission,
-) (reservationReady, done <-chan struct{}) {
+) (reservationReady, done <-chan struct{}, started bool) {
 	reservationSource := admission.reservationReady()
 	state := &httpConnectResponseFlowControlAdmissionState{
 		admission:        admission,
@@ -145,7 +145,7 @@ func (c *ProxyClientConnection) startHTTPConnectResponseFlowControlAdmission(
 	if receiveReservation {
 		go c.receiveHTTPConnectResponseFlowControlReservation(state, reservationSource)
 	}
-	return state.reservationReady, state.done
+	return state.reservationReady, state.done, true
 }
 
 // receiveHTTPConnectResponseFlowControlReservation is the sole receiver for a

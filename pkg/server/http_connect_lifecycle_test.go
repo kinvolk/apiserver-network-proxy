@@ -405,6 +405,17 @@ func TestHTTPConnectResponseFlowControlAdmissionLifecycle(t *testing.T) {
 			t.Fatalf("%s frontend cleanup did not complete", label)
 		}
 	}
+	startAdmission := func(
+		connection *ProxyClientConnection,
+		admission *httpConnectFlowControlAdmission,
+	) (reservationReady, done <-chan struct{}) {
+		t.Helper()
+		reservationReady, done, started := connection.startHTTPConnectResponseFlowControlAdmission(admission)
+		if !started {
+			t.Fatal("initial response flow-control admission start was rejected")
+		}
+		return reservationReady, done
+	}
 
 	// An immediately assigned reservation becomes connection-owned without
 	// establishing the tunnel, then a local abort releases it without waiting
@@ -412,7 +423,7 @@ func TestHTTPConnectResponseFlowControlAdmissionLifecycle(t *testing.T) {
 	ownedAllocator := newHTTPConnectFlowControlAllocator(windowSize, windowSize, 0)
 	ownedAdmission := requireHTTPConnectFlowControlAdmission(t, ownedAllocator, httpConnectFlowControlAdmissionGranted)
 	ownedConnection, ownedFrontend := newConnection()
-	ownedReady, ownedDone := ownedConnection.startHTTPConnectResponseFlowControlAdmission(ownedAdmission)
+	ownedReady, ownedDone := startAdmission(ownedConnection, ownedAdmission)
 	select {
 	case <-ownedReady:
 	default:
@@ -442,7 +453,7 @@ func TestHTTPConnectResponseFlowControlAdmissionLifecycle(t *testing.T) {
 	)
 	queuedAdmission := requireHTTPConnectFlowControlAdmission(t, queuedAllocator, httpConnectFlowControlAdmissionQueued)
 	queuedConnection, queuedFrontend := newConnection()
-	queuedReady, queuedDone := queuedConnection.startHTTPConnectResponseFlowControlAdmission(queuedAdmission)
+	queuedReady, queuedDone := startAdmission(queuedConnection, queuedAdmission)
 	select {
 	case <-queuedReady:
 		t.Fatal("queued admission published reservation readiness without capacity")
@@ -478,7 +489,7 @@ func TestHTTPConnectResponseFlowControlAdmissionLifecycle(t *testing.T) {
 	)
 	liveAdmission := requireHTTPConnectFlowControlAdmission(t, liveAllocator, httpConnectFlowControlAdmissionQueued)
 	liveConnection, liveFrontend := newConnection()
-	liveReady, liveDone := liveConnection.startHTTPConnectResponseFlowControlAdmission(liveAdmission)
+	liveReady, liveDone := startAdmission(liveConnection, liveAdmission)
 	select {
 	case <-liveReady:
 		t.Fatal("live queued admission published reservation readiness without capacity")
@@ -520,7 +531,7 @@ func TestHTTPConnectResponseFlowControlAdmissionLifecycle(t *testing.T) {
 		)
 		admission := requireHTTPConnectFlowControlAdmission(t, allocator, httpConnectFlowControlAdmissionQueued)
 		connection, frontend := newConnection()
-		_, done := connection.startHTTPConnectResponseFlowControlAdmission(admission)
+		_, done := startAdmission(connection, admission)
 
 		ready := make(chan struct{}, 2)
 		start := make(chan struct{})
@@ -553,6 +564,78 @@ func TestHTTPConnectResponseFlowControlAdmissionLifecycle(t *testing.T) {
 		assertHTTPConnectFlowControlAllocatorUsage(t, allocator, 0, 0)
 		assertNoSuccessfulResponse("assignment/abort race", connection, frontend)
 		waitForFrontendClose("assignment/abort race", connection)
+	}
+}
+
+func TestHTTPConnectResponseFlowControlAdmissionRejectsDuplicateStart(t *testing.T) {
+	const windowSize = int64(32)
+	allocator := newHTTPConnectFlowControlAllocator(windowSize, windowSize, 1)
+	server := newWriterTestServer()
+	frontend := newWriterTestImmediateHTTP()
+	connection := &ProxyClientConnection{
+		Mode:      ModeHTTPConnect,
+		HTTP:      frontend,
+		CloseHTTP: frontend.close,
+		closed:    make(chan struct{}),
+		connected: make(chan struct{}),
+	}
+
+	firstAdmission := requireHTTPConnectFlowControlAdmission(t, allocator, httpConnectFlowControlAdmissionGranted)
+	firstReady, firstDone, firstStarted := connection.startHTTPConnectResponseFlowControlAdmission(firstAdmission)
+	if !firstStarted {
+		t.Fatal("initial admission start was rejected")
+	}
+	select {
+	case <-firstReady:
+	default:
+		t.Fatal("initial admission did not publish reservation readiness")
+	}
+	connection.httpMu.Lock()
+	firstState := connection.httpResponseFlowControlAdmission
+	var firstReservation *httpConnectFlowControlReservation
+	if firstState != nil {
+		firstReservation = firstState.reservation
+	}
+	connection.httpMu.Unlock()
+	if firstState == nil || firstReservation == nil {
+		t.Fatal("initial admission did not retain connection-owned reservation state")
+	}
+
+	secondAdmission := requireHTTPConnectFlowControlAdmission(t, allocator, httpConnectFlowControlAdmissionQueued)
+	secondReady, secondDone, secondStarted := connection.startHTTPConnectResponseFlowControlAdmission(secondAdmission)
+	connection.httpMu.Lock()
+	stateAfterSecondStart := connection.httpResponseFlowControlAdmission
+	connection.httpMu.Unlock()
+
+	// Converge both the current overwriting implementation and the rejecting
+	// implementation before reporting the semantic result. On rejection the
+	// caller retains the second admission; on overwrite abortHTTP owns it while
+	// the saved first reservation remains independently releasable.
+	if !secondStarted && !secondAdmission.cancel() {
+		t.Fatal("rejected duplicate admission did not remain caller-owned")
+	}
+	connection.abortHTTP(server, httpConnectAbortFrontendClose)
+	firstReservation.release()
+	select {
+	case <-connection.closed:
+	case <-time.After(writerTestSafetyTimeout):
+		t.Fatal("duplicate-start cleanup did not close the frontend")
+	}
+	assertHTTPConnectFlowControlAllocatorUsage(t, allocator, 0, 0)
+
+	if secondStarted {
+		t.Fatal("duplicate admission start = true, want false")
+	}
+	if secondReady != nil || secondDone != nil {
+		t.Fatalf("rejected duplicate admission signals = (%v, %v), want (nil, nil)", secondReady, secondDone)
+	}
+	if stateAfterSecondStart != firstState {
+		t.Fatal("duplicate admission start replaced the connection-owned state")
+	}
+	select {
+	case <-firstDone:
+	default:
+		t.Fatal("original admission did not converge after duplicate rejection and abort")
 	}
 }
 
