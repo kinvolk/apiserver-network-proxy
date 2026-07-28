@@ -685,6 +685,8 @@ func (a *Client) remoteToSendChannelWithFlowControl(connID int64, eConn *endpoin
 
 		n, err := eConn.conn.Read(buf[:readSize])
 		klog.V(5).InfoS("received flow-controlled data from remote", "bytes", n, "connectionID", connID)
+		// Negotiated DATA must be non-empty; a zero-byte successful Read
+		// consumes no credit and is retried.
 		if n > 0 {
 			if !state.commitRead(n) {
 				klog.ErrorS(nil, "response flow-control read exceeded granted credit", "bytes", n, "connectionID", connID)

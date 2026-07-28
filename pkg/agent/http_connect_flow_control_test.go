@@ -306,6 +306,135 @@ func TestHTTPConnectResponseFlowControlFramesEOFBytesBeforeClose(t *testing.T) {
 	}
 }
 
+func TestHTTPConnectResponseFlowControlCommitsBeforeQueuePublication(t *testing.T) {
+	const connectID = int64(7104)
+	firstPayload := []byte("first response payload")
+	queuedPayload := []byte("queued response payload")
+	blockedPayload := []byte("payload blocked before queue publication")
+	grantedBytes := len(firstPayload) + len(queuedPayload) + len(blockedPayload)
+
+	state := newAgentToServerFlowControlState()
+	state.advanceSendLimit(uint64(grantedBytes))
+	stopCh := make(chan struct{})
+	// Blocking the first DATA Send fills this depth-one queue with queuedPayload,
+	// leaving blockedPayload stuck at publication. Moving commitRead below the
+	// queue send therefore leaves committedTotal short of grantedBytes.
+	sendCh := make(chan []byte, 1)
+	sendDone := make(chan struct{})
+	// The pipe supplies only the embedded net.Conn methods for the scripted reader.
+	endpointBase, endpointPeer := net.Pipe()
+	endpoint := &zeroThenChunkedConn{
+		Conn:              endpointBase,
+		chunks:            [][]byte{firstPayload, queuedPayload, blockedPayload},
+		allPayloadRead:    make(chan struct{}),
+		readBeyondPayload: make(chan struct{}),
+	}
+	stream := &observingDataSendBlockingStream{
+		dataSends:   make(chan []byte, 3),
+		sendRelease: make(chan struct{}),
+	}
+	eConn := &endpointConn{
+		conn:                endpoint,
+		connID:              connectID,
+		cleanFunc:           func() {},
+		responseFlowControl: state,
+		sendCh:              sendCh,
+		sendDone:            sendDone,
+	}
+	testClient := &Client{
+		connManager: newConnectionManager(),
+		stopCh:      stopCh,
+		stream:      stream,
+	}
+	producerDone := make(chan struct{})
+	go func() {
+		defer close(producerDone)
+		testClient.remoteToSendChannelWithFlowControl(connectID, eConn, make([]byte, agentToServerDataFrameSize))
+	}()
+	go testClient.sendChannelToProxy(connectID, eConn)
+
+	var shutdownOnce sync.Once
+	shutdown := func() {
+		shutdownOnce.Do(func() {
+			state.close()
+			close(stopCh)
+			select {
+			case <-producerDone:
+			case <-time.After(agentFlowControlTestSafetyTimeout):
+				t.Error("response producer did not stop during queued-byte test cleanup")
+			}
+			close(sendCh)
+			close(stream.sendRelease)
+			select {
+			case <-sendDone:
+			case <-time.After(agentFlowControlTestSafetyTimeout):
+				t.Error("response DATA sender did not stop during queued-byte test cleanup")
+			}
+			_ = endpoint.Close()
+			_ = endpointPeer.Close()
+		})
+	}
+	t.Cleanup(shutdown)
+
+	receiveDataSend := func(stage string) []byte {
+		select {
+		case data := <-stream.dataSends:
+			return data
+		case <-time.After(agentFlowControlTestSafetyTimeout):
+			t.Fatalf("response DATA sender did not attempt the %s payload", stage)
+			return nil
+		}
+	}
+	firstData := receiveDataSend("first non-empty")
+	if !bytes.Equal(firstData, firstPayload) {
+		t.Fatalf("first response DATA = %q, want %q after an empty successful endpoint Read", firstData, firstPayload)
+	}
+	select {
+	case <-endpoint.allPayloadRead:
+	case <-time.After(agentFlowControlTestSafetyTimeout):
+		t.Fatal("response producer did not read the payload that must be committed before queue publication")
+	}
+	waitForCommittedResponseBytes(t, state, uint64(grantedBytes))
+
+	state.mu.Lock()
+	sendLimit := state.sendLimit
+	committedTotal := state.committedTotal
+	sentTotal := state.sentTotal
+	state.mu.Unlock()
+	if sendLimit != uint64(grantedBytes) || committedTotal != uint64(grantedBytes) || sentTotal != 0 {
+		t.Fatalf("state while payload publication is blocked by a full queue = {sendLimit: %d, committedTotal: %d, sentTotal: %d}, want %d, %d, 0", sendLimit, committedTotal, sentTotal, grantedBytes, grantedBytes)
+	}
+	if got := len(sendCh); got != 1 {
+		t.Fatalf("queued response payloads while first DATA Send is blocked = %d, want 1", got)
+	}
+
+	stream.sendRelease <- struct{}{}
+	secondData := receiveDataSend("queued")
+	if !bytes.Equal(secondData, queuedPayload) {
+		t.Fatalf("second response DATA = %q, want queued payload %q", secondData, queuedPayload)
+	}
+	waitForResponseFlowControlWait(t, state, endpoint.readBeyondPayload)
+	state.mu.Lock()
+	committedTotal = state.committedTotal
+	sentTotal = state.sentTotal
+	state.mu.Unlock()
+	if committedTotal != uint64(grantedBytes) || sentTotal != uint64(len(firstPayload)) {
+		t.Fatalf("state after blocked payload enters the queue = {committedTotal: %d, sentTotal: %d}, want %d, %d", committedTotal, sentTotal, grantedBytes, len(firstPayload))
+	}
+	if got := len(sendCh); got != 1 {
+		t.Fatalf("queued response payloads while second DATA Send is blocked = %d, want 1", got)
+	}
+	wantReadSizes := []int{grantedBytes, grantedBytes, len(queuedPayload) + len(blockedPayload), len(blockedPayload)}
+	if !slices.Equal(endpoint.readSizes, wantReadSizes) {
+		t.Fatalf("endpoint Read sizes after empty successful Read = %v, want %v", endpoint.readSizes, wantReadSizes)
+	}
+
+	shutdown()
+	if stream.dataSendCount != 3 {
+		t.Fatalf("response DATA Sends after one empty and three non-empty Reads = %d, want 3", stream.dataSendCount)
+	}
+}
+
 func TestHTTPConnectResponseFlowControlRequiresOffer(t *testing.T) {
 	const (
 		dialID   = int64(7102)
@@ -1112,6 +1241,37 @@ func waitForResponseFlowControlWait(t *testing.T, state *agentToServerFlowContro
 	}
 }
 
+func waitForCommittedResponseBytes(t *testing.T, state *agentToServerFlowControlState, want uint64) {
+	t.Helper()
+
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	timeout := time.NewTimer(agentFlowControlTestSafetyTimeout)
+	defer timeout.Stop()
+
+	for {
+		state.mu.Lock()
+		committedTotal := state.committedTotal
+		closed := state.closed
+		state.mu.Unlock()
+		if committedTotal == want {
+			return
+		}
+		if committedTotal > want {
+			t.Fatalf("response bytes committed before queue publication = %d, exceeded grant %d", committedTotal, want)
+		}
+		if closed {
+			t.Fatalf("response flow-control state closed with %d committed bytes, want %d", committedTotal, want)
+		}
+
+		select {
+		case <-ticker.C:
+		case <-timeout.C:
+			t.Fatalf("response bytes committed before queue publication = %d, want %d", committedTotal, want)
+		}
+	}
+}
+
 type readObservedConn struct {
 	net.Conn
 	readOnce    sync.Once
@@ -1137,4 +1297,53 @@ func (c *dataAndEOFConn) Read(p []byte) (int, error) {
 		return n, io.EOF
 	}
 	return n, nil
+}
+
+type zeroThenChunkedConn struct {
+	net.Conn
+	chunks            [][]byte
+	emptyReadReturned bool
+	readSizes         []int
+	allPayloadRead    chan struct{}
+	readBeyondPayload chan struct{}
+}
+
+func (c *zeroThenChunkedConn) Read(p []byte) (int, error) {
+	c.readSizes = append(c.readSizes, len(p))
+	if !c.emptyReadReturned {
+		c.emptyReadReturned = true
+		return 0, nil
+	}
+	if len(c.chunks) == 0 {
+		close(c.readBeyondPayload)
+		return 0, errors.New("endpoint Read exceeded granted response payload")
+	}
+
+	n := copy(p, c.chunks[0])
+	if n == len(c.chunks[0]) {
+		c.chunks = c.chunks[1:]
+		if len(c.chunks) == 0 {
+			close(c.allPayloadRead)
+		}
+	} else {
+		c.chunks[0] = c.chunks[0][n:]
+	}
+	return n, nil
+}
+
+type observingDataSendBlockingStream struct {
+	agentproto.AgentService_ConnectClient
+
+	dataSendCount int
+	dataSends     chan []byte
+	sendRelease   chan struct{}
+}
+
+func (s *observingDataSendBlockingStream) Send(packet *client.Packet) error {
+	if packet.GetType() == client.PacketType_DATA {
+		s.dataSendCount++
+		s.dataSends <- slices.Clone(packet.GetData().GetData())
+		<-s.sendRelease
+	}
+	return nil
 }
