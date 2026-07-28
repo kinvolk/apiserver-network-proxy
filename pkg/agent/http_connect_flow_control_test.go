@@ -552,6 +552,127 @@ func TestHTTPConnectResponseFlowControlWindowUpdateWakesOnlyTarget(t *testing.T)
 	}
 }
 
+type secondDataSendBlockingStream struct {
+	agentproto.AgentService_ConnectClient
+
+	dataSendCount     int
+	secondSendStarted chan struct{}
+	secondSendRelease <-chan struct{}
+}
+
+func (s *secondDataSendBlockingStream) Send(packet *client.Packet) error {
+	if packet.GetType() == client.PacketType_DATA {
+		s.dataSendCount++
+		if s.dataSendCount == 2 {
+			close(s.secondSendStarted)
+			<-s.secondSendRelease
+		}
+	}
+	return nil
+}
+
+func TestHTTPConnectResponseFlowControlRecordsSuccessfulDataSend(t *testing.T) {
+	const (
+		connectID       = int64(7301)
+		remainingCredit = 9
+		maxFrameSize    = 1 << 12
+	)
+	firstPayload := []byte("first committed response")
+	secondPayload := []byte("second committed response")
+	committedBytes := len(firstPayload) + len(secondPayload)
+
+	state := newAgentToServerFlowControlState()
+	t.Cleanup(state.close)
+	state.advanceSendLimit(uint64(committedBytes + remainingCredit))
+	if !state.commitRead(committedBytes) {
+		t.Fatalf("commit response read of %d bytes was rejected", committedBytes)
+	}
+
+	readSize, ok := state.nextReadSize(maxFrameSize)
+	if !ok || readSize != remainingCredit {
+		t.Fatalf("read allowance before committed DATA is sent = %d, %t, want %d, true", readSize, ok, remainingCredit)
+	}
+
+	secondSendStarted := make(chan struct{})
+	secondSendRelease := make(chan struct{})
+	var releaseSecondSend sync.Once
+	releaseSecond := func() {
+		releaseSecondSend.Do(func() {
+			close(secondSendRelease)
+		})
+	}
+	sendCh := make(chan []byte, 2)
+	sendDone := make(chan struct{})
+	t.Cleanup(func() {
+		releaseSecond()
+		select {
+		case <-sendDone:
+		case <-time.After(agentFlowControlTestSafetyTimeout):
+			t.Error("response DATA sender did not finish during cleanup")
+		}
+	})
+	eConn := &endpointConn{
+		connID:              connectID,
+		responseFlowControl: state,
+		sendCh:              sendCh,
+		sendDone:            sendDone,
+	}
+	stream := &secondDataSendBlockingStream{
+		secondSendStarted: secondSendStarted,
+		secondSendRelease: secondSendRelease,
+	}
+	testClient := &Client{stream: stream}
+	sendCh <- firstPayload
+	sendCh <- secondPayload
+	close(sendCh)
+	go testClient.sendChannelToProxy(connectID, eConn)
+
+	select {
+	case <-secondSendStarted:
+	case <-sendDone:
+		t.Fatal("response DATA sender finished before attempting the second send")
+	case <-time.After(agentFlowControlTestSafetyTimeout):
+		t.Fatal("response DATA sender did not attempt the second send")
+	}
+	if got := stream.dataSendCount; got != 2 {
+		t.Fatalf("DATA Send attempts before second send release = %d, want 2", got)
+	}
+
+	state.mu.Lock()
+	sendLimit := state.sendLimit
+	committedTotal := state.committedTotal
+	sentTotal := state.sentTotal
+	state.mu.Unlock()
+	if want := uint64(len(firstPayload)); sentTotal != want {
+		t.Fatalf("sent response bytes while second DATA Send is blocked = %d, want %d", sentTotal, want)
+	}
+	if want := uint64(committedBytes + remainingCredit); sendLimit != want || committedTotal != uint64(committedBytes) {
+		t.Fatalf("state while second DATA Send is blocked = {sendLimit: %d, committedTotal: %d}, want %d, %d", sendLimit, committedTotal, want, committedBytes)
+	}
+
+	releaseSecond()
+	select {
+	case <-sendDone:
+	case <-time.After(agentFlowControlTestSafetyTimeout):
+		t.Fatal("response DATA sender did not finish")
+	}
+	if got := stream.dataSendCount; got != 2 {
+		t.Fatalf("completed DATA Sends = %d, want 2", got)
+	}
+
+	state.mu.Lock()
+	sendLimit = state.sendLimit
+	committedTotal = state.committedTotal
+	sentTotal = state.sentTotal
+	state.mu.Unlock()
+	if want := uint64(committedBytes); sentTotal != want {
+		t.Fatalf("sent response bytes after both successful DATA Sends = %d, want %d", sentTotal, want)
+	}
+	if want := uint64(committedBytes + remainingCredit); sendLimit != want || committedTotal != uint64(committedBytes) {
+		t.Fatalf("state after both successful DATA Sends = {sendLimit: %d, committedTotal: %d}, want %d, %d", sendLimit, committedTotal, want, committedBytes)
+	}
+}
+
 func newWindowUpdatePacket(connectID int64, limit uint64) *client.Packet {
 	return &client.Packet{
 		Type: client.PacketType_WINDOW_UPDATE,

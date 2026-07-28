@@ -29,6 +29,7 @@ type agentToServerFlowControlState struct {
 
 	sendLimit      uint64
 	committedTotal uint64
+	sentTotal      uint64
 	closed         bool
 	// waiting exposes credit-wait entry to tests; protocol behavior does not
 	// depend on it.
