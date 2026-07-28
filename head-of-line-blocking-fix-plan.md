@@ -700,8 +700,9 @@ flow-control implementation must satisfy all six assertions together.
 - Update coalescing keeps at most one pending or in-flight marker per
   connection.
 - Publication raced with immediate valid DATA never falsely rejects that DATA.
-- Fair scheduling prevents one readable endpoint from starving another flow
-  with available credit.
+- Explicit fair or round-robin scheduling across simultaneously readable
+  agent endpoints is not part of this response HOL fix; the existing
+  agent-to-server DATA send scheduling remains unchanged.
 
 ### Admission and memory tests
 
