@@ -125,15 +125,16 @@ type ProxyClientConnection struct {
 	httpConnectResponseMode httpConnectResponseMode
 
 	// HTTP-CONNECT output and terminal state. httpMu protects writer
-	// attachment, terminal-before-attachment, connection identifiers used by
-	// asynchronous cleanup, and CLOSE_REQ suppression. It is never held during
-	// HTTP or backend I/O.
-	httpMu                   sync.Mutex
-	httpWriter               *httpConnectWriter
-	httpTerminal             bool
-	httpInitialResponse      []byte
-	httpSuppressCloseRequest bool
-	closed                   chan struct{}
+	// attachment, terminal-before-attachment, response flow-control resource
+	// ownership, connection identifiers used by asynchronous cleanup, and
+	// CLOSE_REQ suppression. It is never held during HTTP or backend I/O.
+	httpMu                           sync.Mutex
+	httpWriter                       *httpConnectWriter
+	httpTerminal                     bool
+	httpInitialResponse              []byte
+	httpSuppressCloseRequest         bool
+	httpResponseFlowControlAdmission *httpConnectResponseFlowControlAdmissionState
+	closed                           chan struct{}
 
 	closeHTTPOnce    sync.Once
 	closeHTTPErr     error
