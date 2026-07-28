@@ -133,6 +133,7 @@ type ProxyClientConnection struct {
 	httpTerminal                     bool
 	httpInitialResponse              []byte
 	httpSuppressCloseRequest         bool
+	httpResponseFlowControlStarted   bool
 	httpResponseFlowControlAdmission *httpConnectResponseFlowControlAdmissionState
 	closed                           chan struct{}
 

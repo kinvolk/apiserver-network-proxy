@@ -50,9 +50,12 @@ type httpConnectFlowControlReservation struct {
 
 // httpConnectResponseFlowControlAdmissionState is the connection-owned slot
 // between allocator admission and later response-flow setup.
-// ProxyClientConnection.httpMu protects every field. reservationReady is only
-// a state notification: the allocator's reservation value is consumed
-// exclusively by this slot.
+// ProxyClientConnection.httpMu protects every field. reservationReady reports
+// only provisional resource ownership: the allocator's reservation value is
+// consumed exclusively by this slot. Before production wiring treats that
+// signal as admission success, it must revalidate the backend generation,
+// endpoint, and selected response mode in addition to the terminal-state check
+// performed here.
 type httpConnectResponseFlowControlAdmissionState struct {
 	admission        *httpConnectFlowControlAdmission
 	reservation      *httpConnectFlowControlReservation
@@ -98,7 +101,8 @@ func (a *httpConnectFlowControlAdmission) reservationReady() <-chan *httpConnect
 // startHTTPConnectResponseFlowControlAdmission transfers one allocator
 // admission to the connection. The caller invokes it once after claiming the
 // PendingDial entry. No caller receives from admission.reservationReady after
-// this ownership transfer.
+// this ownership transfer. If started is false, no ownership transfer occurred
+// and the caller remains responsible for the supplied admission.
 func (c *ProxyClientConnection) startHTTPConnectResponseFlowControlAdmission(
 	admission *httpConnectFlowControlAdmission,
 ) (reservationReady, done <-chan struct{}, started bool) {
@@ -117,6 +121,11 @@ func (c *ProxyClientConnection) startHTTPConnectResponseFlowControlAdmission(
 		receiveReservation   bool
 	)
 	c.httpMu.Lock()
+	if c.httpResponseFlowControlStarted {
+		c.httpMu.Unlock()
+		return nil, nil, false
+	}
+	c.httpResponseFlowControlStarted = true
 	c.httpResponseFlowControlAdmission = state
 	select {
 	case reservation := <-reservationSource:
