@@ -467,6 +467,46 @@ func TestHTTPConnectResponseFlowControlAdmissionLifecycle(t *testing.T) {
 	assertNoSuccessfulResponse("aborted queued admission", queuedConnection, queuedFrontend)
 	waitForFrontendClose("aborted queued admission", queuedConnection)
 
+	// A live queued connection takes ownership when capacity becomes available.
+	// Readiness is only an ownership signal: it neither completes admission nor
+	// establishes the frontend, and the reservation remains charged until the
+	// connection terminates.
+	liveAllocator := newHTTPConnectFlowControlAllocator(windowSize, windowSize, 1)
+	liveHolder := requireHTTPConnectFlowControlReservation(
+		t,
+		requireHTTPConnectFlowControlAdmission(t, liveAllocator, httpConnectFlowControlAdmissionGranted),
+	)
+	liveAdmission := requireHTTPConnectFlowControlAdmission(t, liveAllocator, httpConnectFlowControlAdmissionQueued)
+	liveConnection, liveFrontend := newConnection()
+	liveReady, liveDone := liveConnection.startHTTPConnectResponseFlowControlAdmission(liveAdmission)
+	select {
+	case <-liveReady:
+		t.Fatal("live queued admission published reservation readiness without capacity")
+	default:
+	}
+	liveHolder.release()
+	select {
+	case <-liveReady:
+	case <-time.After(writerTestSafetyTimeout):
+		t.Fatal("live queued admission did not publish reservation readiness after capacity release")
+	}
+	select {
+	case <-liveDone:
+		t.Fatal("live queued admission became terminal after receiving capacity")
+	default:
+	}
+	assertHTTPConnectFlowControlAllocatorUsage(t, liveAllocator, windowSize, 0)
+	assertNoSuccessfulResponse("assigned queued admission", liveConnection, liveFrontend)
+	liveConnection.abortHTTP(server, httpConnectAbortFrontendClose)
+	select {
+	case <-liveDone:
+	default:
+		t.Fatal("local abort did not synchronously release the queued connection's reservation")
+	}
+	assertHTTPConnectFlowControlAllocatorUsage(t, liveAllocator, 0, 0)
+	assertNoSuccessfulResponse("aborted assigned admission", liveConnection, liveFrontend)
+	waitForFrontendClose("aborted assigned admission", liveConnection)
+
 	// Assignment and terminal abort start together. Cancellation may remove the
 	// waiter, or assignment may make W reachable first; either linearization
 	// must converge through the one connection-owned receiver with no resource
