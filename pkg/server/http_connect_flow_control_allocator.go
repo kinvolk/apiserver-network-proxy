@@ -82,6 +82,14 @@ func (a *httpConnectFlowControlAdmission) reservationReady() <-chan *httpConnect
 	return a.ready
 }
 
+// startHTTPConnectResponseFlowControlAdmission is an inert seam for the
+// connection-owned admission lifecycle contract.
+func (c *ProxyClientConnection) startHTTPConnectResponseFlowControlAdmission(
+	admission *httpConnectFlowControlAdmission,
+) (reservationReady, done <-chan struct{}) {
+	return make(chan struct{}), make(chan struct{})
+}
+
 func (a *httpConnectFlowControlAdmission) cancel() bool {
 	a.allocator.mu.Lock()
 	defer a.allocator.mu.Unlock()

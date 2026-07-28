@@ -365,6 +365,157 @@ func TestHTTPConnectWedgedGracefulCloseIsConnectionLocal(t *testing.T) {
 	}
 }
 
+func TestHTTPConnectResponseFlowControlAdmissionLifecycle(t *testing.T) {
+	const windowSize = int64(32)
+	server := newWriterTestServer()
+
+	newConnection := func() (*ProxyClientConnection, *writerTestImmediateHTTP) {
+		frontend := newWriterTestImmediateHTTP()
+		return &ProxyClientConnection{
+			Mode:      ModeHTTPConnect,
+			HTTP:      frontend,
+			CloseHTTP: frontend.close,
+			closed:    make(chan struct{}),
+			connected: make(chan struct{}),
+		}, frontend
+	}
+	assertNoSuccessfulResponse := func(label string, connection *ProxyClientConnection, frontend *writerTestImmediateHTTP) {
+		t.Helper()
+		select {
+		case <-connection.connected:
+			t.Fatalf("%s signaled connected", label)
+		default:
+		}
+		written, _, _ := frontend.snapshot()
+		if len(written) != 0 {
+			t.Fatalf("%s wrote HTTP response %q, want none", label, written)
+		}
+		connection.httpMu.Lock()
+		writer := connection.httpWriter
+		connection.httpMu.Unlock()
+		if writer != nil {
+			t.Fatalf("%s attached HTTP writer %p", label, writer)
+		}
+	}
+	waitForFrontendClose := func(label string, connection *ProxyClientConnection) {
+		t.Helper()
+		select {
+		case <-connection.closed:
+		case <-time.After(writerTestSafetyTimeout):
+			t.Fatalf("%s frontend cleanup did not complete", label)
+		}
+	}
+
+	// An immediately assigned reservation becomes connection-owned without
+	// establishing the tunnel, then a local abort releases it without waiting
+	// for CLOSE_RSP. Repeated aborts must not change aggregate accounting.
+	ownedAllocator := newHTTPConnectFlowControlAllocator(windowSize, windowSize, 0)
+	ownedAdmission := requireHTTPConnectFlowControlAdmission(t, ownedAllocator, httpConnectFlowControlAdmissionGranted)
+	ownedConnection, ownedFrontend := newConnection()
+	ownedReady, ownedDone := ownedConnection.startHTTPConnectResponseFlowControlAdmission(ownedAdmission)
+	select {
+	case <-ownedReady:
+	default:
+		t.Fatal("granted admission did not publish connection-owned reservation readiness")
+	}
+	assertHTTPConnectFlowControlAllocatorUsage(t, ownedAllocator, windowSize, 0)
+	assertNoSuccessfulResponse("granted admission", ownedConnection, ownedFrontend)
+	ownedConnection.abortHTTP(server, httpConnectAbortFrontendClose)
+	select {
+	case <-ownedDone:
+	default:
+		t.Fatal("local abort did not synchronously release the connection-owned reservation")
+	}
+	assertHTTPConnectFlowControlAllocatorUsage(t, ownedAllocator, 0, 0)
+	ownedConnection.abortHTTP(server, httpConnectAbortFrontendClose)
+	assertHTTPConnectFlowControlAllocatorUsage(t, ownedAllocator, 0, 0)
+	assertNoSuccessfulResponse("aborted granted admission", ownedConnection, ownedFrontend)
+	waitForFrontendClose("aborted granted admission", ownedConnection)
+
+	// A terminal transition while capacity is unavailable removes the queued
+	// waiter before a later release can assign it. The connection-owned path is
+	// the sole receiver of the allocator's reservation value.
+	queuedAllocator := newHTTPConnectFlowControlAllocator(windowSize, windowSize, 1)
+	holder := requireHTTPConnectFlowControlReservation(
+		t,
+		requireHTTPConnectFlowControlAdmission(t, queuedAllocator, httpConnectFlowControlAdmissionGranted),
+	)
+	queuedAdmission := requireHTTPConnectFlowControlAdmission(t, queuedAllocator, httpConnectFlowControlAdmissionQueued)
+	queuedConnection, queuedFrontend := newConnection()
+	queuedReady, queuedDone := queuedConnection.startHTTPConnectResponseFlowControlAdmission(queuedAdmission)
+	select {
+	case <-queuedReady:
+		t.Fatal("queued admission published reservation readiness without capacity")
+	default:
+	}
+	assertHTTPConnectFlowControlAllocatorUsage(t, queuedAllocator, windowSize, 1)
+	assertNoSuccessfulResponse("queued admission", queuedConnection, queuedFrontend)
+	queuedConnection.abortHTTP(server, httpConnectAbortFrontendClose)
+	select {
+	case <-queuedDone:
+	default:
+		t.Fatal("terminal abort did not synchronously cancel the queued admission")
+	}
+	assertHTTPConnectFlowControlAllocatorUsage(t, queuedAllocator, windowSize, 0)
+	holder.release()
+	assertHTTPConnectFlowControlAllocatorUsage(t, queuedAllocator, 0, 0)
+	select {
+	case <-queuedReady:
+		t.Fatal("cancelled admission published reservation readiness after capacity release")
+	default:
+	}
+	assertNoSuccessfulResponse("aborted queued admission", queuedConnection, queuedFrontend)
+	waitForFrontendClose("aborted queued admission", queuedConnection)
+
+	// Assignment and terminal abort start together. Cancellation may remove the
+	// waiter, or assignment may make W reachable first; either linearization
+	// must converge through the one connection-owned receiver with no resource
+	// retained and no successful frontend establishment.
+	const raceIterations = 40
+	for i := 0; i < raceIterations; i++ {
+		allocator := newHTTPConnectFlowControlAllocator(windowSize, windowSize, 1)
+		raceHolder := requireHTTPConnectFlowControlReservation(
+			t,
+			requireHTTPConnectFlowControlAdmission(t, allocator, httpConnectFlowControlAdmissionGranted),
+		)
+		admission := requireHTTPConnectFlowControlAdmission(t, allocator, httpConnectFlowControlAdmissionQueued)
+		connection, frontend := newConnection()
+		_, done := connection.startHTTPConnectResponseFlowControlAdmission(admission)
+
+		ready := make(chan struct{}, 2)
+		start := make(chan struct{})
+		var racers sync.WaitGroup
+		racers.Add(2)
+		go func() {
+			defer racers.Done()
+			ready <- struct{}{}
+			<-start
+			raceHolder.release()
+		}()
+		go func() {
+			defer racers.Done()
+			ready <- struct{}{}
+			<-start
+			connection.abortHTTP(server, httpConnectAbortFrontendClose)
+		}()
+		<-ready
+		<-ready
+		close(start)
+		racers.Wait()
+
+		select {
+		case <-done:
+		case <-time.After(writerTestSafetyTimeout):
+			t.Fatalf("iteration %d: assignment/abort ownership did not converge", i)
+		}
+		assertHTTPConnectFlowControlAllocatorUsage(t, allocator, 0, 0)
+		connection.abortHTTP(server, httpConnectAbortFrontendClose)
+		assertHTTPConnectFlowControlAllocatorUsage(t, allocator, 0, 0)
+		assertNoSuccessfulResponse("assignment/abort race", connection, frontend)
+		waitForFrontendClose("assignment/abort race", connection)
+	}
+}
+
 // This test races the real DIAL_RSP routing path against the Tunnel teardown
 // ownership operation. It asserts publication and side-effect semantics, not
 // the current implementation's number or placement of terminal checks.
