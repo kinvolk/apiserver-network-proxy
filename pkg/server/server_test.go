@@ -52,6 +52,48 @@ import (
 
 const xfrChannelSize = 10
 
+func TestProxyServerHTTPConnectFlowControlDefaults(t *testing.T) {
+	p := NewProxyServer("", []proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault}, 1, nil, xfrChannelSize)
+
+	if got, want := p.httpConnectFlowControlWindowSize, int64(64<<10); got != want {
+		t.Errorf("HTTP CONNECT flow-control window size = %d, want %d", got, want)
+	}
+	if got, want := p.httpConnectFlowControlPoolSize, int64(128<<20); got != want {
+		t.Errorf("HTTP CONNECT flow-control pool size = %d, want %d", got, want)
+	}
+	if got, want := p.httpConnectFlowControlMaxPendingAdmissions, 256; got != want {
+		t.Errorf("HTTP CONNECT flow-control maximum pending admissions = %d, want %d", got, want)
+	}
+	if got, want := p.httpConnectFlowControlAdmissionTimeout, time.Second; got != want {
+		t.Errorf("HTTP CONNECT flow-control admission timeout = %v, want %v", got, want)
+	}
+}
+
+func TestProxyServerSetsHTTPConnectFlowControlConfig(t *testing.T) {
+	p := NewProxyServer("", []proxystrategies.ProxyStrategy{proxystrategies.ProxyStrategyDefault}, 1, nil, xfrChannelSize)
+
+	const (
+		windowSize           int64 = 17
+		poolSize             int64 = 101
+		maxPendingAdmissions       = 7
+		admissionTimeout           = 13 * time.Nanosecond
+	)
+	p.SetHTTPConnectFlowControlConfig(windowSize, poolSize, maxPendingAdmissions, admissionTimeout)
+
+	if got := p.httpConnectFlowControlWindowSize; got != windowSize {
+		t.Errorf("HTTP CONNECT flow-control window size = %d, want %d", got, windowSize)
+	}
+	if got := p.httpConnectFlowControlPoolSize; got != poolSize {
+		t.Errorf("HTTP CONNECT flow-control pool size = %d, want %d", got, poolSize)
+	}
+	if got := p.httpConnectFlowControlMaxPendingAdmissions; got != maxPendingAdmissions {
+		t.Errorf("HTTP CONNECT flow-control maximum pending admissions = %d, want %d", got, maxPendingAdmissions)
+	}
+	if got := p.httpConnectFlowControlAdmissionTimeout; got != admissionTimeout {
+		t.Errorf("HTTP CONNECT flow-control admission timeout = %v, want %v", got, admissionTimeout)
+	}
+}
+
 func TestAgentTokenAuthenticationErrorsToken(t *testing.T) {
 	stub := gomock.NewController(t)
 	defer stub.Finish()

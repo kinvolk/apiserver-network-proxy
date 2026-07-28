@@ -67,6 +67,10 @@ func TestDefaultServerOptions(t *testing.T) {
 	assertDefaultValue(t, "APIContentType", defaultServerOptions.APIContentType, "application/vnd.kubernetes.protobuf")
 	assertDefaultValue(t, "GracefulShutdownTimeout", defaultServerOptions.GracefulShutdownTimeout, 0*time.Second)
 	assertDefaultValue(t, "BackendDialTimeout", defaultServerOptions.BackendDialTimeout, 0*time.Second)
+	assertDefaultValue(t, "HTTPConnectFlowControlWindowSize", defaultServerOptions.HTTPConnectFlowControlWindowSize, int64(64<<10))
+	assertDefaultValue(t, "HTTPConnectFlowControlPoolSize", defaultServerOptions.HTTPConnectFlowControlPoolSize, int64(128<<20))
+	assertDefaultValue(t, "HTTPConnectFlowControlMaxPendingAdmissions", defaultServerOptions.HTTPConnectFlowControlMaxPendingAdmissions, 256)
+	assertDefaultValue(t, "HTTPConnectFlowControlAdmissionTimeout", defaultServerOptions.HTTPConnectFlowControlAdmissionTimeout, time.Second)
 
 }
 
@@ -92,6 +96,182 @@ func TestHTTPConnectFlowControlFlag(t *testing.T) {
 	}
 	if got, want := flag.Value.String(), "true"; got != want {
 		t.Fatalf("server flag %q value = %q, want %q", name, got, want)
+	}
+}
+
+func TestHTTPConnectFlowControlTuningFlags(t *testing.T) {
+	testCases := []struct {
+		name        string
+		wantDefault string
+		wantUsage   string
+		setValue    string
+	}{
+		{
+			name:        "http-connect-flow-control-window-size",
+			wantDefault: "65536",
+			wantUsage:   "Bytes reserved and advertised for each admitted HTTP CONNECT flow-control connection. Currently applies only to agent-to-server response DATA; server-to-agent request DATA remains legacy.",
+			setValue:    "32768",
+		},
+		{
+			name:        "http-connect-flow-control-pool-size",
+			wantDefault: "134217728",
+			wantUsage:   "Maximum aggregate HTTP CONNECT flow-control capacity reserved by this process, in bytes. Currently applies only to agent-to-server response DATA; server-to-agent request DATA remains legacy.",
+			setValue:    "67108864",
+		},
+		{
+			name:        "http-connect-flow-control-max-pending-admissions",
+			wantDefault: "256",
+			wantUsage:   "Maximum negotiated HTTP CONNECT connections waiting for flow-control admission before HTTP 200. Set to 0 to disable waiting. Currently applies only to agent-to-server response DATA; server-to-agent request DATA remains legacy.",
+			setValue:    "12",
+		},
+		{
+			name:        "http-connect-flow-control-admission-timeout",
+			wantDefault: "1s",
+			wantUsage:   "Maximum time a negotiated HTTP CONNECT connection waits for flow-control admission before HTTP 200. Currently applies only to agent-to-server response DATA; server-to-agent request DATA remains legacy.",
+			setValue:    "750ms",
+		},
+	}
+
+	flags := NewProxyRunOptions().Flags()
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			flag := flags.Lookup(tc.name)
+			if flag == nil {
+				t.Fatalf("server flag %q is not registered", tc.name)
+			}
+			if got := flag.DefValue; got != tc.wantDefault {
+				t.Fatalf("server flag %q default = %q, want %q", tc.name, got, tc.wantDefault)
+			}
+			if got := flag.Usage; got != tc.wantUsage {
+				t.Fatalf("server flag %q usage = %q, want %q", tc.name, got, tc.wantUsage)
+			}
+			if err := flags.Set(tc.name, tc.setValue); err != nil {
+				t.Fatalf("set server flag %q: %v", tc.name, err)
+			}
+			if got := flag.Value.String(); got != tc.setValue {
+				t.Fatalf("server flag %q value = %q, want %q", tc.name, got, tc.setValue)
+			}
+		})
+	}
+}
+
+func TestHTTPConnectFlowControlValidation(t *testing.T) {
+	testCases := []struct {
+		name    string
+		mutate  func(*ProxyRunOptions)
+		wantErr string
+	}{
+		{name: "defaults"},
+		{
+			name: "zero window size",
+			mutate: func(o *ProxyRunOptions) {
+				o.HTTPConnectFlowControlWindowSize = 0
+			},
+			wantErr: "http-connect-flow-control-window-size must be greater than 0, got 0",
+		},
+		{
+			name: "negative window size",
+			mutate: func(o *ProxyRunOptions) {
+				o.HTTPConnectFlowControlWindowSize = -1
+			},
+			wantErr: "http-connect-flow-control-window-size must be greater than 0, got -1",
+		},
+		{
+			name: "zero pool size",
+			mutate: func(o *ProxyRunOptions) {
+				o.HTTPConnectFlowControlPoolSize = 0
+			},
+			wantErr: "http-connect-flow-control-pool-size must be greater than 0, got 0",
+		},
+		{
+			name: "negative pool size",
+			mutate: func(o *ProxyRunOptions) {
+				o.HTTPConnectFlowControlPoolSize = -1
+			},
+			wantErr: "http-connect-flow-control-pool-size must be greater than 0, got -1",
+		},
+		{
+			name: "pool smaller than one window",
+			mutate: func(o *ProxyRunOptions) {
+				o.HTTPConnectFlowControlPoolSize = o.HTTPConnectFlowControlWindowSize - 1
+			},
+			wantErr: "http-connect-flow-control-pool-size (65535) must be at least http-connect-flow-control-window-size (65536)",
+		},
+		{
+			name: "pool equal to one window",
+			mutate: func(o *ProxyRunOptions) {
+				o.HTTPConnectFlowControlPoolSize = o.HTTPConnectFlowControlWindowSize
+			},
+		},
+		{
+			name: "negative maximum pending admissions",
+			mutate: func(o *ProxyRunOptions) {
+				o.HTTPConnectFlowControlMaxPendingAdmissions = -1
+			},
+			wantErr: "http-connect-flow-control-max-pending-admissions must be non-negative, got -1",
+		},
+		{
+			name: "disabled queue permits zero timeout",
+			mutate: func(o *ProxyRunOptions) {
+				o.HTTPConnectFlowControlMaxPendingAdmissions = 0
+				o.HTTPConnectFlowControlAdmissionTimeout = 0
+			},
+		},
+		{
+			name: "disabled queue permits negative timeout",
+			mutate: func(o *ProxyRunOptions) {
+				o.HTTPConnectFlowControlMaxPendingAdmissions = 0
+				o.HTTPConnectFlowControlAdmissionTimeout = -time.Second
+			},
+		},
+		{
+			name: "non-empty queue rejects zero timeout",
+			mutate: func(o *ProxyRunOptions) {
+				o.HTTPConnectFlowControlMaxPendingAdmissions = 1
+				o.HTTPConnectFlowControlAdmissionTimeout = 0
+			},
+			wantErr: "http-connect-flow-control-admission-timeout must be greater than 0 when http-connect-flow-control-max-pending-admissions is non-zero, got 0s",
+		},
+		{
+			name: "non-empty queue rejects negative timeout",
+			mutate: func(o *ProxyRunOptions) {
+				o.HTTPConnectFlowControlMaxPendingAdmissions = 1
+				o.HTTPConnectFlowControlAdmissionTimeout = -time.Second
+			},
+			wantErr: "http-connect-flow-control-admission-timeout must be greater than 0 when http-connect-flow-control-max-pending-admissions is non-zero, got -1s",
+		},
+		{
+			name: "non-empty queue accepts positive timeout",
+			mutate: func(o *ProxyRunOptions) {
+				o.HTTPConnectFlowControlMaxPendingAdmissions = 1
+				o.HTTPConnectFlowControlAdmissionTimeout = time.Nanosecond
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			o := NewProxyRunOptions()
+			o.UdsName = "/tmp/proxy.sock"
+			o.ServerPort = 0
+			if tc.mutate != nil {
+				tc.mutate(o)
+			}
+
+			err := o.Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Validate() error = nil, want %q", tc.wantErr)
+			}
+			if got := err.Error(); got != tc.wantErr {
+				t.Fatalf("Validate() error = %q, want %q", got, tc.wantErr)
+			}
+		})
 	}
 }
 

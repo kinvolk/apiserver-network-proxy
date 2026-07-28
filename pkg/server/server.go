@@ -305,6 +305,12 @@ type ProxyServer struct {
 	// enableHTTPConnectFlowControl is startup policy. Backend streams snapshot
 	// it before publication.
 	enableHTTPConnectFlowControl bool
+
+	// HTTP CONNECT flow-control tuning is startup configuration.
+	httpConnectFlowControlWindowSize           int64
+	httpConnectFlowControlPoolSize             int64
+	httpConnectFlowControlMaxPendingAdmissions int
+	httpConnectFlowControlAdmissionTimeout     time.Duration
 }
 
 // AgentTokenAuthenticationOptions contains list of parameters required for agent token based authentication
@@ -588,6 +594,11 @@ func (s *ProxyServer) SetBackendDialTimeout(timeout time.Duration) {
 // before backend streams are accepted.
 func (s *ProxyServer) SetHTTPConnectFlowControlEnabled(enabled bool) {
 	s.enableHTTPConnectFlowControl = enabled
+}
+
+// SetHTTPConnectFlowControlConfig configures startup tuning and must be
+// called before backend streams are accepted.
+func (s *ProxyServer) SetHTTPConnectFlowControlConfig(windowSize, poolSize int64, maxPendingAdmissions int, admissionTimeout time.Duration) {
 }
 
 // Proxy handles incoming streams from gRPC frontend.

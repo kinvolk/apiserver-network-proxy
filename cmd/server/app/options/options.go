@@ -45,6 +45,11 @@ type ProxyRunOptions struct {
 	Mode string
 	// Enables negotiated HTTP CONNECT flow control.
 	EnableHTTPConnectFlowControl bool
+	// HTTP CONNECT flow-control tuning. These values are startup-only.
+	HTTPConnectFlowControlWindowSize           int64
+	HTTPConnectFlowControlPoolSize             int64
+	HTTPConnectFlowControlMaxPendingAdmissions int
+	HTTPConnectFlowControlAdmissionTimeout     time.Duration
 	// Location for use by the "unix" network. Setting enables UDS for server connections.
 	UdsName string
 	// If file UdsName already exists, delete the file before listen on that UDS file.

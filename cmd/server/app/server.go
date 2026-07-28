@@ -97,6 +97,9 @@ type Proxy struct {
 
 type StopFunc func(context.Context) error
 
+func logHTTPConnectFlowControlConfig(_ func(string, ...interface{}), _ *options.ProxyRunOptions) {
+}
+
 func (p *Proxy) Run(o *options.ProxyRunOptions, stopCh <-chan struct{}) error {
 	o.Print()
 	if err := o.Validate(); err != nil {
