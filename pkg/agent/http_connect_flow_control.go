@@ -16,7 +16,11 @@ limitations under the License.
 
 package agent
 
-import "sync"
+import (
+	"sync"
+
+	client "sigs.k8s.io/apiserver-network-proxy/konnectivity-client/proto/client"
+)
 
 type agentToServerFlowControlState struct {
 	mu sync.Mutex
@@ -29,4 +33,78 @@ type agentToServerFlowControlState struct {
 	// waiting exposes credit-wait entry to tests; protocol behavior does not
 	// depend on it.
 	waiting bool
+}
+
+func offeredAgentToServerFlowControlV1(features []client.FlowControlFeature) bool {
+	for _, feature := range features {
+		if feature == client.FlowControlFeature_AGENT_TO_SERVER_BYTE_WINDOW_V1 {
+			return true
+		}
+	}
+	return false
+}
+
+func newAgentToServerFlowControlState() *agentToServerFlowControlState {
+	state := &agentToServerFlowControlState{}
+	state.changed = sync.NewCond(&state.mu)
+	return state
+}
+
+func (s *agentToServerFlowControlState) advanceSendLimit(maxDataOffset uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed || maxDataOffset <= s.sendLimit {
+		return
+	}
+	s.sendLimit = maxDataOffset
+	s.changed.Broadcast()
+}
+
+func (s *agentToServerFlowControlState) nextReadSize(maxFrameSize int) (int, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for !s.closed && s.committedTotal == s.sendLimit {
+		s.waiting = true
+		s.changed.Wait()
+		s.waiting = false
+	}
+	if s.closed {
+		return 0, false
+	}
+
+	allowance := s.sendLimit - s.committedTotal
+	if allowance > uint64(maxFrameSize) {
+		return maxFrameSize, true
+	}
+	return int(allowance), true
+}
+
+func (s *agentToServerFlowControlState) commitRead(n int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Validate before unsigned arithmetic so invalid input or corrupt state
+	// cannot manufacture allowance through conversion or subtraction underflow.
+	if n < 0 || s.committedTotal > s.sendLimit {
+		return false
+	}
+	amount := uint64(n)
+	if amount > s.sendLimit-s.committedTotal {
+		return false
+	}
+	s.committedTotal += amount
+	return true
+}
+
+func (s *agentToServerFlowControlState) close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return
+	}
+	s.closed = true
+	s.changed.Broadcast()
 }

@@ -426,6 +426,9 @@ func (a *Client) Serve() {
 			eConn.cleanFunc = func() {
 				// block on purpose
 				<-dialDone
+				if eConn.responseFlowControl != nil {
+					eConn.responseFlowControl.close()
+				}
 				if eConn.conn == nil {
 					// TODO: move this guard lower
 					klog.ErrorS(fmt.Errorf("remote connection is nil"), "could not send CLOSE_RESP to nil connection")
@@ -516,6 +519,12 @@ func (a *Client) Serve() {
 				metrics.Metrics.ObserveDialLatency(time.Since(start))
 				klog.V(3).InfoS("Endpoint connection established", "dialID", dialReq.Random, "connectionID", connID, "dialAddress", dialReq.Address)
 				eConn.conn = conn
+				if a.enableHTTPConnectFlowControl && offeredAgentToServerFlowControlV1(dialReq.GetOfferedFlowControlFeatures()) {
+					eConn.responseFlowControl = newAgentToServerFlowControlState()
+					dialResp.GetDialResponse().AcceptedFlowControlFeatures = []client.FlowControlFeature{
+						client.FlowControlFeature_AGENT_TO_SERVER_BYTE_WINDOW_V1,
+					}
+				}
 				a.connManager.Add(connID, eConn)
 				dialResp.GetDialResponse().ConnectID = connID
 				labels := runpprof.Labels(
@@ -540,6 +549,15 @@ func (a *Client) Serve() {
 				go runpprof.Do(context.Background(), labels, func(context.Context) { a.sendChannelToProxy(connID, eConn) })
 				go runpprof.Do(context.Background(), labels, func(context.Context) { a.dataChannelToRemote(connID, eConn) })
 			})
+
+		case client.PacketType_WINDOW_UPDATE:
+			update := pkt.GetWindowUpdate()
+			eConn, ok := a.connManager.Get(update.GetConnectId())
+			if !ok || eConn.responseFlowControl == nil {
+				klog.V(2).InfoS("received WINDOW_UPDATE for unrecognized or legacy connection", "connectionID", update.GetConnectId())
+				continue
+			}
+			eConn.responseFlowControl.advanceSendLimit(update.GetMaxDataOffset())
 
 		case client.PacketType_DATA:
 			data := pkt.GetData()
@@ -606,6 +624,10 @@ func (a *Client) remoteToSendChannel(connID int64, eConn *endpointConn) {
 	defer eConn.cleanup()
 
 	var buf [1 << 12]byte
+	if eConn.responseFlowControl != nil {
+		a.remoteToSendChannelWithFlowControl(connID, eConn, buf[:])
+		return
+	}
 
 	for {
 		n, err := eConn.conn.Read(buf[:])
@@ -633,6 +655,45 @@ func (a *Client) remoteToSendChannel(connID int64, eConn *endpointConn) {
 		select {
 		case eConn.sendCh <- data:
 		case <-a.stopCh:
+			return
+		}
+	}
+}
+
+func (a *Client) remoteToSendChannelWithFlowControl(connID int64, eConn *endpointConn, buf []byte) {
+	state := eConn.responseFlowControl
+	for {
+		readSize, ok := state.nextReadSize(len(buf))
+		if !ok {
+			return
+		}
+
+		n, err := eConn.conn.Read(buf[:readSize])
+		klog.V(5).InfoS("received flow-controlled data from remote", "bytes", n, "connectionID", connID)
+		if n > 0 {
+			if !state.commitRead(n) {
+				klog.ErrorS(nil, "response flow-control read exceeded granted credit", "bytes", n, "connectionID", connID)
+				return
+			}
+			data := make([]byte, n)
+			copy(data, buf[:n])
+			select {
+			case eConn.sendCh <- data:
+			case <-a.stopCh:
+				return
+			}
+		}
+
+		if err == io.EOF {
+			klog.V(2).InfoS("remote connection EOF", "connectionID", connID)
+			return
+		}
+		if err != nil {
+			if _, ok := a.connManager.Get(connID); !ok {
+				klog.V(5).InfoS("reading from a closed connection", "connectionID", connID, "err", err)
+			} else {
+				klog.ErrorS(err, "connection read failure", "connectionID", connID)
+			}
 			return
 		}
 	}
