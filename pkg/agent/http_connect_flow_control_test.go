@@ -18,6 +18,7 @@ package agent
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net"
 	"slices"
@@ -712,6 +713,148 @@ func TestHTTPConnectResponseFlowControlRejectsInvalidSendProgress(t *testing.T) 
 			state.mu.Unlock()
 			if committedTotal != test.committedTotal || sentTotal != test.sentTotal {
 				t.Fatalf("state after rejected send progress = {committedTotal: %d, sentTotal: %d}, want %d, %d", committedTotal, sentTotal, test.committedTotal, test.sentTotal)
+			}
+		})
+	}
+}
+
+type responseDataSendFailureStream struct {
+	agentproto.AgentService_ConnectClient
+
+	failDataSend int
+	dataSends    int
+}
+
+func (s *responseDataSendFailureStream) Send(packet *client.Packet) error {
+	if packet.GetType() != client.PacketType_DATA {
+		return nil
+	}
+	s.dataSends++
+	if s.dataSends == s.failDataSend {
+		return errors.New("injected response DATA Send failure")
+	}
+	return nil
+}
+
+func TestHTTPConnectResponseFlowControlSendFailureIsTerminal(t *testing.T) {
+	const (
+		connectID    = int64(7401)
+		maxFrameSize = 1 << 12
+	)
+	firstPayload := []byte("successfully sent response")
+	failingPayload := []byte("ambiguous response DATA")
+	backlogPayload := []byte("committed response backlog")
+
+	for _, test := range []struct {
+		name           string
+		failDataSend   int
+		committedTotal int
+	}{
+		{
+			name:           "transport send error",
+			failDataSend:   2,
+			committedTotal: len(firstPayload) + len(failingPayload) + len(backlogPayload),
+		},
+		{
+			name:           "send progress rejection",
+			committedTotal: len(firstPayload) + len(failingPayload) - 1,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state := newAgentToServerFlowControlState()
+			state.sendLimit = uint64(test.committedTotal)
+			state.committedTotal = uint64(test.committedTotal)
+
+			type allowanceResult struct {
+				size int
+				ok   bool
+			}
+			nextAllowance := make(chan allowanceResult, 1)
+			go func() {
+				size, ok := state.nextReadSize(maxFrameSize)
+				nextAllowance <- allowanceResult{size: size, ok: ok}
+			}()
+			waitForResponseFlowControlWait(t, state, nil)
+
+			endpoint, peer := net.Pipe()
+			manager := newConnectionManager()
+			sendCh := make(chan []byte, 3)
+			sendDone := make(chan struct{})
+			cleanupDone := make(chan struct{})
+			cleanupCalls := 0
+			eConn := &endpointConn{
+				conn:                endpoint,
+				connID:              connectID,
+				responseFlowControl: state,
+				sendCh:              sendCh,
+				sendDone:            sendDone,
+			}
+			eConn.cleanFunc = func() {
+				cleanupCalls++
+				state.close()
+				manager.Delete(connectID)
+				_ = endpoint.Close()
+				close(cleanupDone)
+			}
+			manager.Add(connectID, eConn)
+			t.Cleanup(func() {
+				eConn.cleanup()
+				_ = peer.Close()
+			})
+
+			stream := &responseDataSendFailureStream{failDataSend: test.failDataSend}
+			testClient := &Client{
+				connManager: manager,
+				cs:          &ClientSet{clients: make(map[string]*Client)},
+				stream:      stream,
+			}
+			sendCh <- firstPayload
+			sendCh <- failingPayload
+			sendCh <- backlogPayload
+			close(sendCh)
+
+			testClient.sendChannelToProxy(connectID, eConn)
+
+			state.mu.Lock()
+			closed := state.closed
+			committedTotal := state.committedTotal
+			sentTotal := state.sentTotal
+			state.mu.Unlock()
+			if !closed {
+				t.Fatal("response flow-control state remained open after terminal DATA send failure")
+			}
+			if want := uint64(len(firstPayload)); sentTotal != want {
+				t.Fatalf("sent response bytes after terminal DATA send failure = %d, want last valid total %d", sentTotal, want)
+			}
+			if committedTotal != uint64(test.committedTotal) {
+				t.Fatalf("committed response bytes after terminal DATA send failure = %d, want unchanged %d", committedTotal, test.committedTotal)
+			}
+			if stream.dataSends != 2 {
+				t.Fatalf("response DATA Send attempts after terminal failure = %d, want 2 with no backlog retry", stream.dataSends)
+			}
+
+			select {
+			case result := <-nextAllowance:
+				if result.ok || result.size != 0 {
+					t.Fatalf("read allowance after terminal DATA send failure = %d, %t, want 0, false", result.size, result.ok)
+				}
+			case <-time.After(agentFlowControlTestSafetyTimeout):
+				t.Fatal("terminal DATA send failure did not wake the response credit wait")
+			}
+			select {
+			case <-cleanupDone:
+			case <-time.After(agentFlowControlTestSafetyTimeout):
+				t.Fatal("terminal DATA send failure did not clean up the endpoint connection")
+			}
+			if _, ok := manager.Get(connectID); ok {
+				t.Fatal("terminal DATA send failure left the endpoint connection published")
+			}
+			if _, err := peer.Write([]byte("post-failure response")); err == nil {
+				t.Fatal("endpoint socket remained writable after terminal DATA send failure")
+			}
+			eConn.cleanup()
+			if cleanupCalls != 1 {
+				t.Fatalf("endpoint cleanup calls after repeated cleanup = %d, want 1", cleanupCalls)
 			}
 		})
 	}
