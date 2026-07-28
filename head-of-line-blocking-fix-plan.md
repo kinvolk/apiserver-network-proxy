@@ -274,6 +274,9 @@ limited by sendLimit minus committedTotal, not by sentTotal. sentTotal advances
 only after a successful DATA Send and must never exceed committedTotal. A Send
 failure is terminal for the backend generation; committed bytes are not rolled
 back or retried because delivery may be ambiguous.
+Terminal sender failure stops silent continuation and terminates the tunnel
+promptly. This does not promise that every frontend protocol can distinguish
+the resulting EOF from a normal close.
 
 All counters start at zero. After the complete HTTP 200, the server publishes
 the initial limit W. When the HTTP writer accepts n bytes, the server may reuse
