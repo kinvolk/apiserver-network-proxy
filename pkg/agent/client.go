@@ -50,6 +50,8 @@ type endpointConn struct {
 	connID    int64
 	cleanFunc func()
 
+	responseFlowControl *agentToServerFlowControlState
+
 	// dataCh is a queue to decouple reads from the ANP Server
 	// to the corresponding writes to the data plane.
 	// This is for traffic coming from the KAS.
@@ -154,6 +156,9 @@ type Client struct {
 	address string
 	opts    []grpc.DialOption
 	conn    *grpc.ClientConn
+
+	// Test seam for observing endpoint I/O without opening a real socket.
+	dialEndpoint func(network, address string, timeout time.Duration) (net.Conn, error)
 
 	drainCh   <-chan struct{}
 	drainOnce sync.Once
@@ -469,7 +474,11 @@ func (a *Client) Serve() {
 			go runpprof.Do(context.Background(), labels, func(context.Context) {
 				defer close(dialDone)
 				start := time.Now()
-				conn, err := net.DialTimeout(dialReq.Protocol, dialReq.Address, dialTimeout)
+				dialEndpoint := net.DialTimeout
+				if a.dialEndpoint != nil {
+					dialEndpoint = a.dialEndpoint
+				}
+				conn, err := dialEndpoint(dialReq.Protocol, dialReq.Address, dialTimeout)
 				if err != nil {
 					reason := metrics.DialFailureUnknown
 					if neterr, ok := err.(net.Error); ok && neterr.Timeout() {

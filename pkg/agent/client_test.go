@@ -42,9 +42,10 @@ func TestServeData_HTTP(t *testing.T) {
 		stopCh:  stopCh,
 	}
 	testClient := &Client{
-		connManager: newConnectionManager(),
-		stopCh:      stopCh,
-		cs:          cs,
+		connManager:                  newConnectionManager(),
+		stopCh:                       stopCh,
+		cs:                           cs,
+		enableHTTPConnectFlowControl: false,
 	}
 	testClient.stream, stream = pipe()
 
@@ -59,9 +60,8 @@ func TestServeData_HTTP(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	// Before agent-side acceptance exists, offered response V1 and an unknown
-	// future feature must not change legacy dial, DATA, or close behavior.
-	// When acceptance lands, this setup must explicitly select disabled policy.
+	// A disabled agent must ignore offered response V1 and an unknown future
+	// feature, preserving legacy dial, DATA, and close behavior.
 	dialPacket := newDialPacket("tcp", ts.URL[len("http://"):], 111)
 	dialPacket.GetDialRequest().OfferedFlowControlFeatures = []client.FlowControlFeature{
 		client.FlowControlFeature_AGENT_TO_SERVER_BYTE_WINDOW_V1,
@@ -89,7 +89,7 @@ func TestServeData_HTTP(t *testing.T) {
 		t.Errorf("expect random=111; got %v", dialRsp.DialResponse.Random)
 	}
 	if got := dialRsp.DialResponse.GetAcceptedFlowControlFeatures(); len(got) != 0 {
-		t.Fatalf("pre-acceptance agent accepted flow-control features %v", got)
+		t.Fatalf("disabled agent accepted flow-control features %v", got)
 	}
 
 	// Send Data (HTTP Request) via (Agent) Client to the test http server
