@@ -595,6 +595,11 @@ func NewProxyServer(serverID string, proxyStrategies []proxystrategies.ProxyStra
 	s.httpConnectFlowControlPoolSize = defaultHTTPConnectFlowControlPoolSize
 	s.httpConnectFlowControlMaxPendingAdmissions = defaultHTTPConnectFlowControlMaxPendingAdmissions
 	s.httpConnectFlowControlAdmissionTimeout = defaultHTTPConnectFlowControlAdmissionTimeout
+	s.httpConnectFlowControlAllocator = newHTTPConnectFlowControlAllocator(
+		s.httpConnectFlowControlWindowSize,
+		s.httpConnectFlowControlPoolSize,
+		s.httpConnectFlowControlMaxPendingAdmissions,
+	)
 	return s
 }
 
@@ -615,6 +620,7 @@ func (s *ProxyServer) SetHTTPConnectFlowControlConfig(windowSize, poolSize int64
 	s.httpConnectFlowControlPoolSize = poolSize
 	s.httpConnectFlowControlMaxPendingAdmissions = maxPendingAdmissions
 	s.httpConnectFlowControlAdmissionTimeout = admissionTimeout
+	s.httpConnectFlowControlAllocator = newHTTPConnectFlowControlAllocator(windowSize, poolSize, maxPendingAdmissions)
 }
 
 // Proxy handles incoming streams from gRPC frontend.
