@@ -302,6 +302,191 @@ func TestHTTPConnectResponseFlowControlRequiresOffer(t *testing.T) {
 	waitForConnectionDeletion(t, testClient, dialResponse.GetConnectID())
 }
 
+func TestHTTPConnectResponseFlowControlUsesMonotonicCumulativeLimits(t *testing.T) {
+	const (
+		initialLimit = uint64(8)
+		higherLimit  = uint64(13)
+		maxFrameSize = 1 << 12
+	)
+
+	state := newAgentToServerFlowControlState()
+	t.Cleanup(state.close)
+
+	state.advanceSendLimit(initialLimit)
+	readSize, ok := state.nextReadSize(maxFrameSize)
+	if !ok || readSize != int(initialLimit) {
+		t.Fatalf("initial read allowance = %d, %t, want %d, true", readSize, ok, initialLimit)
+	}
+	if !state.commitRead(readSize) {
+		t.Fatalf("commit initial read of %d bytes was rejected", readSize)
+	}
+
+	type allowanceResult struct {
+		size int
+		ok   bool
+	}
+	nextAllowance := make(chan allowanceResult, 1)
+	go func() {
+		size, ok := state.nextReadSize(maxFrameSize)
+		nextAllowance <- allowanceResult{size: size, ok: ok}
+	}()
+	waitForResponseFlowControlWait(t, state, nil)
+
+	for _, update := range []struct {
+		name  string
+		limit uint64
+	}{
+		{name: "duplicate", limit: initialLimit},
+		{name: "lower", limit: initialLimit - 1},
+	} {
+		t.Run(update.name, func(t *testing.T) {
+			state.advanceSendLimit(update.limit)
+			state.mu.Lock()
+			sendLimit := state.sendLimit
+			committedTotal := state.committedTotal
+			state.mu.Unlock()
+			if sendLimit != initialLimit || committedTotal != initialLimit {
+				t.Fatalf("state after cumulative limit %d = {sendLimit: %d, committedTotal: %d}, want both %d", update.limit, sendLimit, committedTotal, initialLimit)
+			}
+		})
+	}
+
+	state.advanceSendLimit(higherLimit)
+	select {
+	case result := <-nextAllowance:
+		want := int(higherLimit - initialLimit)
+		if !result.ok || result.size != want {
+			t.Fatalf("read allowance after cumulative limit increase = %d, %t, want delta %d, true", result.size, result.ok, want)
+		}
+	case <-time.After(agentFlowControlTestSafetyTimeout):
+		t.Fatal("higher cumulative limit did not wake the waiting response producer")
+	}
+}
+
+func TestHTTPConnectResponseFlowControlWindowUpdateWakesOnlyTarget(t *testing.T) {
+	const (
+		firstConnectID  = int64(7201)
+		secondConnectID = int64(7202)
+		firstLimit      = uint64(11)
+		secondLimit     = uint64(7)
+		maxFrameSize    = 1 << 12
+	)
+
+	stopCh := make(chan struct{})
+	clientSet := &ClientSet{
+		clients: make(map[string]*Client),
+		stopCh:  stopCh,
+	}
+	clientStream, serverStream := pipe()
+	testClient := &Client{
+		connManager:   newConnectionManager(),
+		stopCh:        stopCh,
+		cs:            clientSet,
+		stream:        clientStream,
+		probeInterval: time.Hour,
+	}
+
+	firstState := newAgentToServerFlowControlState()
+	secondState := newAgentToServerFlowControlState()
+	addConnection := func(connectID int64, state *agentToServerFlowControlState) {
+		endpoint := &endpointConn{
+			connID:              connectID,
+			responseFlowControl: state,
+		}
+		endpoint.cleanFunc = func() {
+			state.close()
+			testClient.connManager.Delete(connectID)
+		}
+		testClient.connManager.Add(connectID, endpoint)
+	}
+	addConnection(firstConnectID, firstState)
+	addConnection(secondConnectID, secondState)
+
+	serveDone := make(chan struct{})
+	go func() {
+		defer close(serveDone)
+		testClient.Serve()
+	}()
+	t.Cleanup(func() {
+		secondState.close()
+		firstState.close()
+		close(stopCh)
+		// fakeStream has no close operation; wake Recv so Serve can observe stopCh.
+		_ = serverStream.Send(&client.Packet{Type: client.PacketType_DRAIN})
+		select {
+		case <-serveDone:
+		case <-time.After(agentFlowControlTestSafetyTimeout):
+			t.Error("agent client did not stop after WINDOW_UPDATE routing test")
+		}
+	})
+
+	type allowanceResult struct {
+		size int
+		ok   bool
+	}
+	startAllowanceWait := func(state *agentToServerFlowControlState) <-chan allowanceResult {
+		result := make(chan allowanceResult, 1)
+		go func() {
+			size, ok := state.nextReadSize(maxFrameSize)
+			result <- allowanceResult{size: size, ok: ok}
+		}()
+		return result
+	}
+	firstAllowance := startAllowanceWait(firstState)
+	secondAllowance := startAllowanceWait(secondState)
+	waitForResponseFlowControlWait(t, firstState, nil)
+	waitForResponseFlowControlWait(t, secondState, nil)
+
+	windowUpdate := func(connectID int64, limit uint64) *client.Packet {
+		return &client.Packet{
+			Type: client.PacketType_WINDOW_UPDATE,
+			Payload: &client.Packet_WindowUpdate{
+				WindowUpdate: &client.WindowUpdate{
+					ConnectId:     connectID,
+					MaxDataOffset: limit,
+				},
+			},
+		}
+	}
+	if err := serverStream.Send(windowUpdate(firstConnectID, firstLimit)); err != nil {
+		t.Fatalf("send first connection WINDOW_UPDATE: %v", err)
+	}
+	select {
+	case result := <-firstAllowance:
+		if !result.ok || result.size != int(firstLimit) {
+			t.Fatalf("first connection allowance = %d, %t, want %d, true", result.size, result.ok, firstLimit)
+		}
+	case <-time.After(agentFlowControlTestSafetyTimeout):
+		t.Fatal("first connection did not wake for its WINDOW_UPDATE")
+	}
+
+	secondState.mu.Lock()
+	secondSendLimit := secondState.sendLimit
+	secondCommittedTotal := secondState.committedTotal
+	secondWaiting := secondState.waiting
+	secondState.mu.Unlock()
+	if secondSendLimit != 0 || secondCommittedTotal != 0 || !secondWaiting {
+		t.Fatalf("untargeted connection state = {sendLimit: %d, committedTotal: %d, waiting: %t}, want 0, 0, true", secondSendLimit, secondCommittedTotal, secondWaiting)
+	}
+	select {
+	case result := <-secondAllowance:
+		t.Fatalf("untargeted connection received allowance %d, %t", result.size, result.ok)
+	default:
+	}
+
+	if err := serverStream.Send(windowUpdate(secondConnectID, secondLimit)); err != nil {
+		t.Fatalf("send second connection WINDOW_UPDATE: %v", err)
+	}
+	select {
+	case result := <-secondAllowance:
+		if !result.ok || result.size != int(secondLimit) {
+			t.Fatalf("second connection allowance = %d, %t, want %d, true", result.size, result.ok, secondLimit)
+		}
+	case <-time.After(agentFlowControlTestSafetyTimeout):
+		t.Fatal("second connection did not wake for its WINDOW_UPDATE")
+	}
+}
+
 type responseFlowControlDialObservation struct {
 	connectionPresent bool
 	state             *agentToServerFlowControlState
