@@ -317,6 +317,7 @@ type ProxyServer struct {
 	httpConnectFlowControlPoolSize             int64
 	httpConnectFlowControlMaxPendingAdmissions int
 	httpConnectFlowControlAdmissionTimeout     time.Duration
+	httpConnectFlowControlAllocator            *httpConnectFlowControlAllocator
 }
 
 // AgentTokenAuthenticationOptions contains list of parameters required for agent token based authentication
