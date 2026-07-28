@@ -745,6 +745,10 @@ func (a *Client) sendChannelToProxy(connID int64, eConn *endpointConn) {
 			// Not worried about queued packets as the clean up should handle it.
 			return
 		}
+		if state := eConn.responseFlowControl; state != nil && !state.recordSend(len(d)) {
+			klog.ErrorS(nil, "response flow-control DATA Send exceeded committed bytes", "bytes", len(d), "connectionID", connID)
+			return
+		}
 	}
 }
 

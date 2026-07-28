@@ -99,6 +99,23 @@ func (s *agentToServerFlowControlState) commitRead(n int) bool {
 	return true
 }
 
+func (s *agentToServerFlowControlState) recordSend(n int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Validate before unsigned arithmetic so invalid input or corrupt state
+	// cannot manufacture send progress through conversion or subtraction underflow.
+	if n < 0 || s.sentTotal > s.committedTotal {
+		return false
+	}
+	amount := uint64(n)
+	if amount > s.committedTotal-s.sentTotal {
+		return false
+	}
+	s.sentTotal += amount
+	return true
+}
+
 func (s *agentToServerFlowControlState) close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()

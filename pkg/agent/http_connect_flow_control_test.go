@@ -588,11 +588,6 @@ func TestHTTPConnectResponseFlowControlRecordsSuccessfulDataSend(t *testing.T) {
 		t.Fatalf("commit response read of %d bytes was rejected", committedBytes)
 	}
 
-	readSize, ok := state.nextReadSize(maxFrameSize)
-	if !ok || readSize != remainingCredit {
-		t.Fatalf("read allowance before committed DATA is sent = %d, %t, want %d, true", readSize, ok, remainingCredit)
-	}
-
 	secondSendStarted := make(chan struct{})
 	secondSendRelease := make(chan struct{})
 	var releaseSecondSend sync.Once
@@ -649,6 +644,10 @@ func TestHTTPConnectResponseFlowControlRecordsSuccessfulDataSend(t *testing.T) {
 	if want := uint64(committedBytes + remainingCredit); sendLimit != want || committedTotal != uint64(committedBytes) {
 		t.Fatalf("state while second DATA Send is blocked = {sendLimit: %d, committedTotal: %d}, want %d, %d", sendLimit, committedTotal, want, committedBytes)
 	}
+	readSize, ok := state.nextReadSize(maxFrameSize)
+	if !ok || readSize != remainingCredit {
+		t.Fatalf("read allowance after first successful DATA Send = %d, %t, want %d, true", readSize, ok, remainingCredit)
+	}
 
 	releaseSecond()
 	select {
@@ -670,6 +669,51 @@ func TestHTTPConnectResponseFlowControlRecordsSuccessfulDataSend(t *testing.T) {
 	}
 	if want := uint64(committedBytes + remainingCredit); sendLimit != want || committedTotal != uint64(committedBytes) {
 		t.Fatalf("state after both successful DATA Sends = {sendLimit: %d, committedTotal: %d}, want %d, %d", sendLimit, committedTotal, want, committedBytes)
+	}
+}
+
+func TestHTTPConnectResponseFlowControlRejectsInvalidSendProgress(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		committedTotal uint64
+		sentTotal      uint64
+		bytes          int
+	}{
+		{
+			name:           "one byte beyond committed",
+			committedTotal: 8,
+			sentTotal:      3,
+			bytes:          6,
+		},
+		{
+			name:           "negative byte count",
+			committedTotal: ^uint64(0),
+			bytes:          -1,
+		},
+		{
+			name:           "corrupt existing progress",
+			committedTotal: 7,
+			sentTotal:      8,
+			bytes:          1,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state := newAgentToServerFlowControlState()
+			state.sendLimit = test.committedTotal
+			state.committedTotal = test.committedTotal
+			state.sentTotal = test.sentTotal
+
+			if state.recordSend(test.bytes) {
+				t.Fatalf("recordSend(%d) = true, want false", test.bytes)
+			}
+			state.mu.Lock()
+			committedTotal := state.committedTotal
+			sentTotal := state.sentTotal
+			state.mu.Unlock()
+			if committedTotal != test.committedTotal || sentTotal != test.sentTotal {
+				t.Fatalf("state after rejected send progress = {committedTotal: %d, sentTotal: %d}, want %d, %d", committedTotal, sentTotal, test.committedTotal, test.sentTotal)
+			}
+		})
 	}
 }
 
