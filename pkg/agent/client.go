@@ -76,6 +76,18 @@ func (e *endpointConn) cleanup() {
 	e.cleanOnce.Do(e.cleanFunc)
 }
 
+// startCleanup makes response production terminal before starting cleanup.
+// cleanup must run asynchronously when the sender calls this because it closes
+// sendCh and waits for the sender to close sendDone. Closing response flow
+// control here intentionally duplicates cleanFunc so termination is synchronous
+// with the sender failure while the remaining cleanup is asynchronous.
+func (e *endpointConn) startCleanup() {
+	if e.responseFlowControl != nil {
+		e.responseFlowControl.close()
+	}
+	go e.cleanup()
+}
+
 func (e *endpointConn) sendViaDataChannel(msg []byte) {
 	defer func() {
 		// Handles the race condition where we write to a closed channel
@@ -435,6 +447,9 @@ func (a *Client) Serve() {
 					return
 				}
 				klog.V(4).InfoS("close connection", "dialID", dialReq.Random, "connectionID", connID, "dialAddress", dialReq.Address)
+				if err := eConn.conn.Close(); err != nil {
+					klog.ErrorS(err, "failed to close connection to remote", "dialID", dialReq.Random, "connectionID", connID)
+				}
 				close(eConn.sendCh)
 				<-eConn.sendDone
 				var closePkt *client.Packet
@@ -462,9 +477,6 @@ func (a *Client) Serve() {
 				}
 				close(eConn.dataCh)
 				a.connManager.Delete(eConn.connID)
-				if err := eConn.conn.Close(); err != nil {
-					klog.ErrorS(err, "failed to close connection to remote", "dialID", dialReq.Random, "connectionID", connID)
-				}
 			}
 			labels := runpprof.Labels(
 				"agentID", a.agentID,
@@ -743,10 +755,12 @@ func (a *Client) sendChannelToProxy(connID int64, eConn *endpointConn) {
 			// Chances are something is fairly wrong. Going to close out what
 			// we are doing so we don't leave hanging goroutines.
 			// Not worried about queued packets as the clean up should handle it.
+			eConn.startCleanup()
 			return
 		}
 		if state := eConn.responseFlowControl; state != nil && !state.recordSend(len(d)) {
 			klog.ErrorS(nil, "response flow-control DATA Send exceeded committed bytes", "bytes", len(d), "connectionID", connID)
+			eConn.startCleanup()
 			return
 		}
 	}

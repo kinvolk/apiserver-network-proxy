@@ -736,6 +736,59 @@ func (s *responseDataSendFailureStream) Send(packet *client.Packet) error {
 	return nil
 }
 
+func TestEndpointConnStartCleanupDoesNotWaitForSender(t *testing.T) {
+	state := newAgentToServerFlowControlState()
+	sendCh := make(chan []byte)
+	sendDone := make(chan struct{})
+	cleanupStarted := make(chan struct{})
+	cleanupDone := make(chan struct{})
+	eConn := &endpointConn{
+		responseFlowControl: state,
+		sendCh:              sendCh,
+		sendDone:            sendDone,
+	}
+	eConn.cleanFunc = func() {
+		close(sendCh)
+		close(cleanupStarted)
+		<-sendDone
+		close(cleanupDone)
+	}
+
+	startReturned := make(chan struct{})
+	go func() {
+		eConn.startCleanup()
+		close(startReturned)
+	}()
+
+	select {
+	case <-cleanupStarted:
+	case <-time.After(agentFlowControlTestSafetyTimeout):
+		t.Fatal("endpoint cleanup did not start")
+	}
+	select {
+	case <-startReturned:
+	case <-time.After(agentFlowControlTestSafetyTimeout):
+		// Release a synchronous implementation before failing so the test does
+		// not leave a permanently blocked sender-cleanup cycle behind.
+		close(sendDone)
+		<-startReturned
+		t.Fatal("startCleanup waited for sender-owned sendDone")
+	}
+
+	state.mu.Lock()
+	closed := state.closed
+	state.mu.Unlock()
+	if !closed {
+		t.Fatal("startCleanup returned before closing response flow-control state")
+	}
+	close(sendDone)
+	select {
+	case <-cleanupDone:
+	case <-time.After(agentFlowControlTestSafetyTimeout):
+		t.Fatal("endpoint cleanup did not finish after sendDone closed")
+	}
+}
+
 func TestHTTPConnectResponseFlowControlSendFailureIsTerminal(t *testing.T) {
 	const (
 		connectID    = int64(7401)
@@ -756,7 +809,9 @@ func TestHTTPConnectResponseFlowControlSendFailureIsTerminal(t *testing.T) {
 			committedTotal: len(firstPayload) + len(failingPayload) + len(backlogPayload),
 		},
 		{
-			name:           "send progress rejection",
+			name: "send progress rejection",
+			// No injected transport error: the short committed total makes
+			// the second successful Send fail recordSend instead.
 			committedTotal: len(firstPayload) + len(failingPayload) - 1,
 		},
 	} {
