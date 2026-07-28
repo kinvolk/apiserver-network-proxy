@@ -190,6 +190,122 @@ func TestHTTPConnectResponseFlowControlWaitsForInitialGrant(t *testing.T) {
 	waitForConnectionDeletion(t, testClient, dialResponse.GetConnectID())
 }
 
+func TestHTTPConnectResponseFlowControlFramesEOFBytesBeforeClose(t *testing.T) {
+	const (
+		dialID   = int64(7103)
+		target   = "flow-control-eof-endpoint.invalid:443"
+		protocol = "tcp"
+		tailSize = 17
+	)
+	payload := make([]byte, agentToServerDataFrameSize+tailSize)
+	for index := range payload {
+		payload[index] = byte(index % 251)
+	}
+
+	stopCh := make(chan struct{})
+	clientSet := &ClientSet{
+		clients:        make(map[string]*Client),
+		stopCh:         stopCh,
+		xfrChannelSize: 1,
+	}
+	// The pipe supplies the embedded net.Conn methods; response bytes come
+	// directly from dataAndEOFConn.Read.
+	endpointBase, endpointPeer := net.Pipe()
+	endpoint := &dataAndEOFConn{
+		Conn:      endpointBase,
+		remaining: payload,
+	}
+	clientStream, serverStream := pipe()
+	testClient := &Client{
+		connManager:                  newConnectionManager(),
+		stopCh:                       stopCh,
+		cs:                           clientSet,
+		stream:                       clientStream,
+		probeInterval:                time.Hour,
+		enableHTTPConnectFlowControl: true,
+		dialEndpoint: func(_, _ string, _ time.Duration) (net.Conn, error) {
+			return endpoint, nil
+		},
+	}
+	serveDone := make(chan struct{})
+	go func() {
+		defer close(serveDone)
+		testClient.Serve()
+	}()
+	t.Cleanup(func() {
+		_ = endpoint.Close()
+		_ = endpointPeer.Close()
+		close(stopCh)
+		// fakeStream has no close operation; wake Recv so Serve observes stopCh.
+		_ = serverStream.Send(&client.Packet{Type: client.PacketType_DRAIN})
+		select {
+		case <-serveDone:
+		case <-time.After(agentFlowControlTestSafetyTimeout):
+			t.Error("agent client did not stop after EOF response test")
+		}
+	})
+
+	dialRequest := newDialPacket(protocol, target, dialID)
+	dialRequest.GetDialRequest().OfferedFlowControlFeatures = []client.FlowControlFeature{
+		client.FlowControlFeature_AGENT_TO_SERVER_BYTE_WINDOW_V1,
+	}
+	if err := serverStream.Send(dialRequest); err != nil {
+		t.Fatalf("send DIAL_REQ: %v", err)
+	}
+	dialResponsePacket, err := serverStream.Recv()
+	if err != nil {
+		t.Fatalf("receive DIAL_RSP: %v", err)
+	}
+	if got := dialResponsePacket.GetType(); got != client.PacketType_DIAL_RSP {
+		t.Fatalf("agent packet type = %v, want DIAL_RSP", got)
+	}
+	dialResponse := dialResponsePacket.GetDialResponse()
+	if got := dialResponse.GetAcceptedFlowControlFeatures(); !slices.Equal(got, dialRequest.GetDialRequest().GetOfferedFlowControlFeatures()) {
+		t.Fatalf("DIAL_RSP accepted flow-control features = %v, want offered response V1", got)
+	}
+
+	if err := serverStream.Send(newWindowUpdatePacket(dialResponse.GetConnectID(), uint64(len(payload)))); err != nil {
+		t.Fatalf("send initial WINDOW_UPDATE: %v", err)
+	}
+	// The first Read is buffer-bound; the second is credit-bound by the tail.
+	for index, want := range [][]byte{payload[:agentToServerDataFrameSize], payload[agentToServerDataFrameSize:]} {
+		packet, err := serverStream.Recv()
+		if err != nil {
+			t.Fatalf("receive response DATA frame %d: %v", index+1, err)
+		}
+		if got := packet.GetType(); got != client.PacketType_DATA {
+			t.Fatalf("agent packet %d after grant = %v, want DATA before close", index+1, got)
+		}
+		if got := packet.GetData().GetConnectID(); got != dialResponse.GetConnectID() {
+			t.Fatalf("response DATA frame %d connect ID = %d, want %d", index+1, got, dialResponse.GetConnectID())
+		}
+		got := packet.GetData().GetData()
+		if len(got) != len(want) {
+			t.Fatalf("response DATA frame %d length = %d, want %d", index+1, len(got), len(want))
+		}
+		for offset := range want {
+			if got[offset] != want[offset] {
+				t.Fatalf("response DATA frame %d byte %d = 0x%02x, want 0x%02x", index+1, offset, got[offset], want[offset])
+			}
+		}
+	}
+
+	closeResponsePacket, err := serverStream.Recv()
+	if err != nil {
+		t.Fatalf("receive CLOSE_RSP after EOF bytes: %v", err)
+	}
+	if got := closeResponsePacket.GetType(); got != client.PacketType_CLOSE_RSP {
+		t.Fatalf("agent packet after EOF response DATA = %v, want CLOSE_RSP", got)
+	}
+	if got := closeResponsePacket.GetCloseResponse().GetConnectID(); got != dialResponse.GetConnectID() {
+		t.Fatalf("CLOSE_RSP connect ID = %d, want %d", got, dialResponse.GetConnectID())
+	}
+	waitForConnectionDeletion(t, testClient, dialResponse.GetConnectID())
+	if !slices.Equal(endpoint.readSizes, []int{agentToServerDataFrameSize, tailSize}) {
+		t.Fatalf("endpoint Read sizes = %v, want buffer-bound %d then credit-bound %d", endpoint.readSizes, agentToServerDataFrameSize, tailSize)
+	}
+}
+
 func TestHTTPConnectResponseFlowControlRequiresOffer(t *testing.T) {
 	const (
 		dialID   = int64(7102)
@@ -1005,4 +1121,20 @@ type readObservedConn struct {
 func (c *readObservedConn) Read(p []byte) (int, error) {
 	c.readOnce.Do(func() { close(c.readStarted) })
 	return c.Conn.Read(p)
+}
+
+type dataAndEOFConn struct {
+	net.Conn
+	remaining []byte
+	readSizes []int
+}
+
+func (c *dataAndEOFConn) Read(p []byte) (int, error) {
+	c.readSizes = append(c.readSizes, len(p))
+	n := copy(p, c.remaining)
+	c.remaining = c.remaining[n:]
+	if len(c.remaining) == 0 {
+		return n, io.EOF
+	}
+	return n, nil
 }

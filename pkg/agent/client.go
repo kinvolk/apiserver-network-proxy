@@ -42,7 +42,10 @@ import (
 	"sigs.k8s.io/apiserver-network-proxy/proto/header"
 )
 
-const dialTimeout = 5 * time.Second
+const (
+	dialTimeout                = 5 * time.Second
+	agentToServerDataFrameSize = 1 << 12
+)
 
 // endpointConn tracks a connection from agent to node network.
 type endpointConn struct {
@@ -635,7 +638,7 @@ func (a *Client) remoteToSendChannel(connID int64, eConn *endpointConn) {
 	}()
 	defer eConn.cleanup()
 
-	var buf [1 << 12]byte
+	var buf [agentToServerDataFrameSize]byte
 	if eConn.responseFlowControl != nil {
 		a.remoteToSendChannelWithFlowControl(connID, eConn, buf[:])
 		return
