@@ -329,16 +329,22 @@ peer may have received the update.
 
 ### Configuration
 
-In addition to its enablement flag, the server exposes four
-response-flow-control tuning settings. They have no effect on legacy
-connections when the flag is disabled or response V1 is not negotiated:
+In addition to its enablement flag, the server exposes four direction-neutral
+HTTP-CONNECT flow-control tuning settings. The names describe local receive
+capacity rather than a wire direction. In this version only the server exposes
+them, and they configure agent-to-server response DATA; server-to-agent request
+DATA remains legacy. Their flag descriptions state that limitation. A future
+request-direction implementation can expose the same names on the agent for
+its local receive capacity, with values configured independently for each
+binary. They have no effect on legacy connections when the flag is disabled or
+response V1 is not negotiated:
 
 | Setting | Default | Meaning |
 | --- | ---: | --- |
-| --response-flow-control-window-size | 64Ki | W reserved and advertised for each admitted response-V1 connection. |
-| --response-flow-control-pool-size | 128Mi | Maximum aggregate response capacity reserved by one server process. |
-| --response-flow-control-max-pending-admissions | 256 | Maximum negotiated connections waiting before HTTP 200; zero disables waiting. |
-| --response-flow-control-admission-timeout | 1s | Initial maximum server-side admission wait; subject to Phase 4 validation and deployment-specific deadline guidance below. |
+| --http-connect-flow-control-window-size | 64Ki | Receiver-local W reserved for each admitted flow and advertised to that flow's sender. |
+| --http-connect-flow-control-pool-size | 128Mi | Maximum aggregate flow-control receive capacity reserved by one process. |
+| --http-connect-flow-control-max-pending-admissions | 256 | Maximum negotiated connections waiting for receiver-local capacity; zero disables waiting. |
+| --http-connect-flow-control-admission-timeout | 1s | Initial maximum receiver-side admission wait; subject to Phase 4 validation and deployment-specific deadline guidance below. |
 
 The agent negotiates the feature, not a numeric window. It obeys the cumulative
 limits published by the server.
