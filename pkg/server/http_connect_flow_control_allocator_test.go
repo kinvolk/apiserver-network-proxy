@@ -135,6 +135,49 @@ func TestHTTPConnectFlowControlAllocatorSkipsCancelledAdmission(t *testing.T) {
 	assertHTTPConnectFlowControlAllocatorUsage(t, allocator, 0, 0)
 }
 
+func TestHTTPConnectFlowControlAllocatorLinearizesCancellationWithAssignment(t *testing.T) {
+	const windowSize = int64(8)
+	allocator := newHTTPConnectFlowControlAllocator(windowSize, windowSize, 1)
+
+	holder := requireHTTPConnectFlowControlReservation(
+		t,
+		requireHTTPConnectFlowControlAdmission(t, allocator, httpConnectFlowControlAdmissionGranted),
+	)
+	waiter := requireHTTPConnectFlowControlAdmission(t, allocator, httpConnectFlowControlAdmissionQueued)
+
+	ready := make(chan struct{}, 2)
+	start := make(chan struct{})
+	releaseDone := make(chan struct{})
+	cancelResult := make(chan bool, 1)
+	go func() {
+		ready <- struct{}{}
+		<-start
+		holder.release()
+		close(releaseDone)
+	}()
+	go func() {
+		ready <- struct{}{}
+		<-start
+		cancelResult <- waiter.cancel()
+	}()
+
+	// Make both transitions eligible together. Either may win, but the result
+	// must agree with reservation ownership after both operations complete.
+	<-ready
+	<-ready
+	close(start)
+	cancellationWon := <-cancelResult
+	<-releaseDone
+
+	if cancellationWon {
+		requireNoHTTPConnectFlowControlReservation(t, waiter)
+	} else {
+		reservation := requireHTTPConnectFlowControlReservation(t, waiter)
+		reservation.release()
+	}
+	assertHTTPConnectFlowControlAllocatorUsage(t, allocator, 0, 0)
+}
+
 func TestProxyServerHTTPConnectFlowControlAllocatorUsesConfiguredLimits(t *testing.T) {
 	const (
 		windowSize           = int64(17)
