@@ -18,6 +18,7 @@ package agent
 
 import (
 	"bytes"
+	"io"
 	"net"
 	"slices"
 	"sync"
@@ -195,6 +196,7 @@ func TestHTTPConnectResponseFlowControlRequiresOffer(t *testing.T) {
 		protocol = "tcp"
 	)
 	payload := []byte("legacy response bytes")
+	requestAfterIgnoredUpdate := []byte("legacy request after ignored WINDOW_UPDATE")
 
 	stopCh := make(chan struct{})
 	clientSet := &ClientSet{
@@ -286,6 +288,38 @@ func TestHTTPConnectResponseFlowControlRequiresOffer(t *testing.T) {
 		t.Fatal("legacy endpoint response write did not complete")
 	}
 
+	requestRead := make(chan error, 1)
+	readRequest := make([]byte, len(requestAfterIgnoredUpdate))
+	go func() {
+		_, err := io.ReadFull(peer, readRequest)
+		requestRead <- err
+	}()
+	if err := serverStream.Send(newWindowUpdatePacket(dialResponse.GetConnectID(), uint64(len(payload)))); err != nil {
+		t.Fatalf("send WINDOW_UPDATE for legacy connection: %v", err)
+	}
+	if err := serverStream.Send(newDataPacket(dialResponse.GetConnectID(), requestAfterIgnoredUpdate)); err != nil {
+		t.Fatalf("send request DATA after ignored legacy WINDOW_UPDATE: %v", err)
+	}
+	select {
+	case err := <-requestRead:
+		if err != nil {
+			t.Fatalf("read request after ignored legacy WINDOW_UPDATE: %v", err)
+		}
+		if !bytes.Equal(readRequest, requestAfterIgnoredUpdate) {
+			t.Fatalf("legacy request after ignored WINDOW_UPDATE = %q, want %q", readRequest, requestAfterIgnoredUpdate)
+		}
+	case <-time.After(agentFlowControlTestSafetyTimeout):
+		t.Fatal("legacy request did not progress after ignored WINDOW_UPDATE")
+	}
+
+	eConn, ok := testClient.connManager.Get(dialResponse.GetConnectID())
+	if !ok {
+		t.Fatal("ignored legacy WINDOW_UPDATE removed the endpoint connection")
+	}
+	if eConn.responseFlowControl != nil {
+		t.Fatal("legacy WINDOW_UPDATE installed response flow-control state")
+	}
+
 	if err := serverStream.Send(newClosePacket(dialResponse.GetConnectID())); err != nil {
 		t.Fatalf("send CLOSE_REQ: %v", err)
 	}
@@ -365,11 +399,14 @@ func TestHTTPConnectResponseFlowControlUsesMonotonicCumulativeLimits(t *testing.
 
 func TestHTTPConnectResponseFlowControlWindowUpdateWakesOnlyTarget(t *testing.T) {
 	const (
-		firstConnectID  = int64(7201)
-		secondConnectID = int64(7202)
-		firstLimit      = uint64(11)
-		secondLimit     = uint64(7)
-		maxFrameSize    = 1 << 12
+		unknownConnectID = int64(7299)
+		legacyConnectID  = int64(7203)
+		firstConnectID   = int64(7201)
+		secondConnectID  = int64(7202)
+		ignoredLimit     = uint64(4093)
+		firstLimit       = uint64(11)
+		secondLimit      = uint64(7)
+		maxFrameSize     = 1 << 12
 	)
 
 	stopCh := make(chan struct{})
@@ -394,17 +431,24 @@ func TestHTTPConnectResponseFlowControlWindowUpdateWakesOnlyTarget(t *testing.T)
 			responseFlowControl: state,
 		}
 		endpoint.cleanFunc = func() {
-			state.close()
+			if state != nil {
+				state.close()
+			}
 			testClient.connManager.Delete(connectID)
 		}
 		testClient.connManager.Add(connectID, endpoint)
 	}
+	addConnection(legacyConnectID, nil)
 	addConnection(firstConnectID, firstState)
 	addConnection(secondConnectID, secondState)
 
 	serveDone := make(chan struct{})
+	var servePanic any
 	go func() {
 		defer close(serveDone)
+		defer func() {
+			servePanic = recover()
+		}()
 		testClient.Serve()
 	}()
 	t.Cleanup(func() {
@@ -415,6 +459,9 @@ func TestHTTPConnectResponseFlowControlWindowUpdateWakesOnlyTarget(t *testing.T)
 		_ = serverStream.Send(&client.Packet{Type: client.PacketType_DRAIN})
 		select {
 		case <-serveDone:
+			if servePanic != nil {
+				t.Errorf("agent client panicked during WINDOW_UPDATE routing test: %v", servePanic)
+			}
 		case <-time.After(agentFlowControlTestSafetyTimeout):
 			t.Error("agent client did not stop after WINDOW_UPDATE routing test")
 		}
@@ -437,18 +484,12 @@ func TestHTTPConnectResponseFlowControlWindowUpdateWakesOnlyTarget(t *testing.T)
 	waitForResponseFlowControlWait(t, firstState, nil)
 	waitForResponseFlowControlWait(t, secondState, nil)
 
-	windowUpdate := func(connectID int64, limit uint64) *client.Packet {
-		return &client.Packet{
-			Type: client.PacketType_WINDOW_UPDATE,
-			Payload: &client.Packet_WindowUpdate{
-				WindowUpdate: &client.WindowUpdate{
-					ConnectId:     connectID,
-					MaxDataOffset: limit,
-				},
-			},
-		}
+	// Serve processes stream packets serially, so each target update is an
+	// ordered checkpoint proving the preceding ignored update was handled first.
+	if err := serverStream.Send(newWindowUpdatePacket(unknownConnectID, ignoredLimit)); err != nil {
+		t.Fatalf("send WINDOW_UPDATE for unknown connection: %v", err)
 	}
-	if err := serverStream.Send(windowUpdate(firstConnectID, firstLimit)); err != nil {
+	if err := serverStream.Send(newWindowUpdatePacket(firstConnectID, firstLimit)); err != nil {
 		t.Fatalf("send first connection WINDOW_UPDATE: %v", err)
 	}
 	select {
@@ -458,6 +499,14 @@ func TestHTTPConnectResponseFlowControlWindowUpdateWakesOnlyTarget(t *testing.T)
 		}
 	case <-time.After(agentFlowControlTestSafetyTimeout):
 		t.Fatal("first connection did not wake for its WINDOW_UPDATE")
+	case <-serveDone:
+		if servePanic != nil {
+			t.Fatalf("agent client panicked on WINDOW_UPDATE for unknown connection: %v", servePanic)
+		}
+		t.Fatal("agent client stopped on WINDOW_UPDATE for unknown connection")
+	}
+	if _, ok := testClient.connManager.Get(unknownConnectID); ok {
+		t.Fatal("WINDOW_UPDATE created state for an unknown connection")
 	}
 
 	secondState.mu.Lock()
@@ -474,7 +523,10 @@ func TestHTTPConnectResponseFlowControlWindowUpdateWakesOnlyTarget(t *testing.T)
 	default:
 	}
 
-	if err := serverStream.Send(windowUpdate(secondConnectID, secondLimit)); err != nil {
+	if err := serverStream.Send(newWindowUpdatePacket(legacyConnectID, ignoredLimit)); err != nil {
+		t.Fatalf("send WINDOW_UPDATE for legacy connection: %v", err)
+	}
+	if err := serverStream.Send(newWindowUpdatePacket(secondConnectID, secondLimit)); err != nil {
 		t.Fatalf("send second connection WINDOW_UPDATE: %v", err)
 	}
 	select {
@@ -484,6 +536,31 @@ func TestHTTPConnectResponseFlowControlWindowUpdateWakesOnlyTarget(t *testing.T)
 		}
 	case <-time.After(agentFlowControlTestSafetyTimeout):
 		t.Fatal("second connection did not wake for its WINDOW_UPDATE")
+	case <-serveDone:
+		if servePanic != nil {
+			t.Fatalf("agent client panicked on WINDOW_UPDATE for legacy connection: %v", servePanic)
+		}
+		t.Fatal("agent client stopped on WINDOW_UPDATE for legacy connection")
+	}
+
+	firstState.mu.Lock()
+	firstSendLimit := firstState.sendLimit
+	firstCommittedTotal := firstState.committedTotal
+	firstState.mu.Unlock()
+	if firstSendLimit != firstLimit || firstCommittedTotal != 0 {
+		t.Fatalf("first connection state after legacy update = {sendLimit: %d, committedTotal: %d}, want %d, 0", firstSendLimit, firstCommittedTotal, firstLimit)
+	}
+}
+
+func newWindowUpdatePacket(connectID int64, limit uint64) *client.Packet {
+	return &client.Packet{
+		Type: client.PacketType_WINDOW_UPDATE,
+		Payload: &client.Packet_WindowUpdate{
+			WindowUpdate: &client.WindowUpdate{
+				ConnectId:     connectID,
+				MaxDataOffset: limit,
+			},
+		},
 	}
 }
 
