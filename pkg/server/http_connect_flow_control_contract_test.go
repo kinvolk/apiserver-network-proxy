@@ -351,6 +351,20 @@ func TestHTTPConnectResponseFlowControlAdmissionRefusalFailsClosed(t *testing.T)
 					},
 				},
 			}
+			consumer.stop(t)
+
+			fixture.pending.httpMu.Lock()
+			writer := fixture.pending.httpWriter
+			admissionState := fixture.pending.httpResponseFlowControlAdmission
+			flowControlState := fixture.pending.httpResponseFlowControl
+			terminal := fixture.pending.httpTerminal
+			fixture.pending.httpMu.Unlock()
+			if !terminal {
+				t.Fatalf("%s admission refusal left the routed connection non-terminal", tt.name)
+			}
+			if writer != nil || admissionState != nil || flowControlState != nil {
+				t.Fatalf("%s admission-refusal resources = (%p, %p, %p), want (nil, nil, nil)", tt.name, writer, admissionState, flowControlState)
+			}
 
 			select {
 			case <-fixture.frontendConn.sink.closeObserved:
@@ -373,15 +387,6 @@ func TestHTTPConnectResponseFlowControlAdmissionRefusalFailsClosed(t *testing.T)
 				t.Fatalf("%s admission refusal published an established connection", tt.name)
 			}
 
-			fixture.pending.httpMu.Lock()
-			writer := fixture.pending.httpWriter
-			admissionState := fixture.pending.httpResponseFlowControlAdmission
-			flowControlState := fixture.pending.httpResponseFlowControl
-			terminal := fixture.pending.httpTerminal
-			fixture.pending.httpMu.Unlock()
-			if writer != nil || admissionState != nil || flowControlState != nil || !terminal {
-				t.Fatalf("%s admission-refusal state = (%p, %p, %p, %v), want (nil, nil, nil, true)", tt.name, writer, admissionState, flowControlState, terminal)
-			}
 			assertHTTPConnectFlowControlAllocatorUsage(t, allocator, windowSize, tt.wantPendingBeforeRefusal)
 
 			select {
