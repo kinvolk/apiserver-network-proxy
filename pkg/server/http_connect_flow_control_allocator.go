@@ -30,6 +30,8 @@ const (
 type httpConnectFlowControlAllocator struct {
 	mu sync.Mutex
 
+	// windowSize is immutable after construction, so installed connection state
+	// may copy it without holding mu.
 	windowSize           int64
 	maxReservations      int64
 	reservedReservations int64

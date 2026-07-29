@@ -291,6 +291,127 @@ func dialLatencySampleCount(t *testing.T) uint64 {
 	return count
 }
 
+func TestHTTPConnectResponseFlowControlAdmissionRefusalFailsClosed(t *testing.T) {
+	const (
+		connectID  = int64(6241)
+		windowSize = int64(32)
+	)
+
+	tests := []struct {
+		name                     string
+		maxPendingAdmissions     int
+		occupyPendingAdmission   bool
+		wantPendingBeforeRefusal int
+	}{
+		{
+			name:                     "queue disabled",
+			maxPendingAdmissions:     0,
+			wantPendingBeforeRefusal: 0,
+		},
+		{
+			name:                     "queue full",
+			maxPendingAdmissions:     1,
+			occupyPendingAdmission:   true,
+			wantPendingBeforeRefusal: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fixture := newHTTPConnectFlowControlDialFixture(t, true)
+			fixture.proxyServer.SetHTTPConnectFlowControlConfig(
+				windowSize,
+				windowSize,
+				tt.maxPendingAdmissions,
+				time.Second,
+			)
+			allocator := fixture.proxyServer.httpConnectFlowControlAllocator
+			holder := requireHTTPConnectFlowControlReservation(
+				t,
+				requireHTTPConnectFlowControlAdmission(t, allocator, httpConnectFlowControlAdmissionGranted),
+			)
+			var occupiedAdmission *httpConnectFlowControlAdmission
+			defer func() {
+				if occupiedAdmission != nil {
+					occupiedAdmission.releaseUnowned()
+				}
+				holder.release()
+			}()
+			if tt.occupyPendingAdmission {
+				occupiedAdmission = requireHTTPConnectFlowControlAdmission(t, allocator, httpConnectFlowControlAdmissionQueued)
+			}
+			assertHTTPConnectFlowControlAllocatorUsage(t, allocator, windowSize, tt.wantPendingBeforeRefusal)
+
+			offered := slices.Clone(fixture.dialRequest.GetOfferedFlowControlFeatures())
+			consumer := startWriterTestBackendConsumer(t, fixture.proxyServer, fixture.backend, fixture.agentID, 1)
+			consumer.recvCh <- &client.Packet{
+				Type: client.PacketType_DIAL_RSP,
+				Payload: &client.Packet_DialResponse{
+					DialResponse: &client.DialResponse{
+						Random:                      fixture.dialRequest.GetRandom(),
+						ConnectID:                   connectID,
+						AcceptedFlowControlFeatures: offered,
+					},
+				},
+			}
+
+			select {
+			case <-fixture.frontendConn.sink.closeObserved:
+			case <-fixture.pending.connected:
+				t.Fatalf("%s admission refusal signaled connected", tt.name)
+			case <-time.After(writerTestSafetyTimeout):
+				t.Fatalf("%s admission refusal did not close the frontend", tt.name)
+			}
+
+			written, _, _, _ := fixture.frontendConn.sink.snapshot()
+			if len(written) != 0 {
+				t.Fatalf("%s admission refusal wrote HTTP response %q, want none before the deferred error writer", tt.name, written)
+			}
+			select {
+			case <-fixture.pending.connected:
+				t.Fatalf("%s admission refusal signaled connected", tt.name)
+			default:
+			}
+			if _, err := fixture.proxyServer.getFrontend(fixture.agentID, connectID); err == nil {
+				t.Fatalf("%s admission refusal published an established connection", tt.name)
+			}
+
+			fixture.pending.httpMu.Lock()
+			writer := fixture.pending.httpWriter
+			admissionState := fixture.pending.httpResponseFlowControlAdmission
+			flowControlState := fixture.pending.httpResponseFlowControl
+			terminal := fixture.pending.httpTerminal
+			fixture.pending.httpMu.Unlock()
+			if writer != nil || admissionState != nil || flowControlState != nil || !terminal {
+				t.Fatalf("%s admission-refusal state = (%p, %p, %p, %v), want (nil, nil, nil, true)", tt.name, writer, admissionState, flowControlState, terminal)
+			}
+			assertHTTPConnectFlowControlAllocatorUsage(t, allocator, windowSize, tt.wantPendingBeforeRefusal)
+
+			select {
+			case got := <-fixture.backendCloseRequests:
+				if got != connectID {
+					t.Fatalf("%s admission refusal closed backend connection %d, want %d", tt.name, got, connectID)
+				}
+			case <-time.After(writerTestSafetyTimeout):
+				t.Fatalf("%s admission refusal did not close the live backend endpoint", tt.name)
+			}
+			fixture.pending.abortHTTP(fixture.proxyServer, httpConnectAbortAdmissionFailed)
+			select {
+			case got := <-fixture.backendCloseRequests:
+				t.Fatalf("%s repeated terminal cleanup sent duplicate CLOSE_REQ for connection %d", tt.name, got)
+			default:
+			}
+
+			if occupiedAdmission != nil {
+				occupiedAdmission.releaseUnowned()
+				occupiedAdmission = nil
+			}
+			holder.release()
+			assertHTTPConnectFlowControlAllocatorUsage(t, allocator, 0, 0)
+		})
+	}
+}
+
 func TestHTTPConnectResponseFlowControlRevalidatesAssignedConnection(t *testing.T) {
 	const (
 		agentID    = "response-flow-revalidation-agent"
@@ -571,15 +692,16 @@ func httpConnectFlowControlDialRequest(t *testing.T, enabled bool) (*client.Dial
 }
 
 type httpConnectFlowControlDialFixture struct {
-	dialRequest   *client.DialRequest
-	pending       *ProxyClientConnection
-	proxyServer   *ProxyServer
-	backend       *Backend
-	agentID       string
-	frontendConn  *observedHTTPConn
-	dialRequests  chan *client.DialRequest
-	cancelBackend context.CancelFunc
-	target        string
+	dialRequest          *client.DialRequest
+	pending              *ProxyClientConnection
+	proxyServer          *ProxyServer
+	backend              *Backend
+	agentID              string
+	frontendConn         *observedHTTPConn
+	dialRequests         chan *client.DialRequest
+	backendCloseRequests chan int64
+	cancelBackend        context.CancelFunc
+	target               string
 }
 
 func newHTTPConnectFlowControlDialFixture(t *testing.T, enabled bool) *httpConnectFlowControlDialFixture {
@@ -605,8 +727,19 @@ func newHTTPConnectFlowControlDialFixtureWithHTTPWrite(
 	ctrl := gomock.NewController(t)
 	backendConn := mockAgentConn(ctrl, agentID, nil)
 	dialRequests := make(chan *client.DialRequest, 1)
+	backendCloseRequests := make(chan int64, 16)
 	backendConn.EXPECT().Send(gomock.Any()).DoAndReturn(func(pkt *client.Packet) error {
 		if pkt.Type == client.PacketType_CLOSE_REQ {
+			closeRequest := pkt.GetCloseRequest()
+			if closeRequest == nil {
+				t.Error("CLOSE_REQ packet has no close request payload")
+				return nil
+			}
+			select {
+			case backendCloseRequests <- closeRequest.ConnectID:
+			default:
+				t.Error("backend received too many CLOSE_REQ packets")
+			}
 			return nil
 		}
 		if pkt.Type != client.PacketType_DIAL_REQ {
@@ -649,12 +782,13 @@ func newHTTPConnectFlowControlDialFixtureWithHTTPWrite(
 	proxyServer.SetHTTPConnectFlowControlEnabled(!enabled)
 
 	fixture := &httpConnectFlowControlDialFixture{
-		proxyServer:   proxyServer,
-		backend:       backend,
-		agentID:       agentID,
-		dialRequests:  dialRequests,
-		cancelBackend: cancelBackend,
-		target:        target,
+		proxyServer:          proxyServer,
+		backend:              backend,
+		agentID:              agentID,
+		dialRequests:         dialRequests,
+		backendCloseRequests: backendCloseRequests,
+		cancelBackend:        cancelBackend,
+		target:               target,
 	}
 	return fixture.startDialWithHTTPWrite(t, releaseInitialHTTPWrite)
 }
@@ -703,15 +837,16 @@ func (f *httpConnectFlowControlDialFixture) startDialWithHTTPWrite(t *testing.T,
 	}
 
 	return &httpConnectFlowControlDialFixture{
-		dialRequest:   dialRequest,
-		pending:       pending,
-		proxyServer:   f.proxyServer,
-		backend:       f.backend,
-		agentID:       f.agentID,
-		frontendConn:  frontendConn,
-		dialRequests:  f.dialRequests,
-		cancelBackend: f.cancelBackend,
-		target:        f.target,
+		dialRequest:          dialRequest,
+		pending:              pending,
+		proxyServer:          f.proxyServer,
+		backend:              f.backend,
+		agentID:              f.agentID,
+		frontendConn:         frontendConn,
+		dialRequests:         f.dialRequests,
+		backendCloseRequests: f.backendCloseRequests,
+		cancelBackend:        f.cancelBackend,
+		target:               f.target,
 	}
 }
 
