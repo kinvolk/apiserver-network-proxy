@@ -80,7 +80,7 @@ func (b *httpConnectResponseBuffer) peek() (data []byte, wait <-chan struct{}, o
 
 	if b.buffered > 0 {
 		length := min(b.buffered, int64(len(b.storage))-b.readOffset)
-		return b.storage[b.readOffset : b.readOffset+length], nil, true
+		return b.storage[b.readOffset : b.readOffset+length : b.readOffset+length], nil, true
 	}
 	if b.closed {
 		return nil, nil, false
