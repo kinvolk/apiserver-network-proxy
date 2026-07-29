@@ -54,10 +54,11 @@ func TestDefaultServerOptions(t *testing.T) {
 	assertDefaultValue(t, "APIContentType", defaultAgentOptions.APIContentType, "application/vnd.kubernetes.protobuf")
 }
 
-func TestHTTPConnectFlowControlFlag(t *testing.T) {
+func TestAgentServerDataFlowControlFlag(t *testing.T) {
 	const (
-		name      = "enable-http-connect-flow-control"
-		wantUsage = "Enable negotiated HTTP CONNECT flow control. Currently applies only to agent-to-server response DATA; server-to-agent request DATA remains legacy."
+		name      = "enable-agent-server-data-flow-control"
+		oldName   = "enable-http-connect-flow-control"
+		wantUsage = "Enable negotiated flow control for DATA exchanged between the agent and proxy servers. Currently applies only to agent-to-server DATA; server-to-agent DATA remains legacy."
 	)
 
 	flags := NewGrpcProxyAgentOptions().Flags()
@@ -76,6 +77,9 @@ func TestHTTPConnectFlowControlFlag(t *testing.T) {
 	}
 	if got, want := flag.Value.String(), "true"; got != want {
 		t.Fatalf("agent flag %q value = %q, want %q", name, got, want)
+	}
+	if oldFlag := flags.Lookup(oldName); oldFlag != nil {
+		t.Fatalf("agent frontend-specific flag %q remains registered", oldName)
 	}
 }
 
