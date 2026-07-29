@@ -1038,6 +1038,41 @@ func (s *ProxyServer) readBackendToChannel(backend *Backend, recvCh chan *client
 	}
 }
 
+func (s *ProxyServer) continueHTTPConnectResponseFlowControlEstablishment(
+	frontend *ProxyClientConnection,
+	expected httpConnectResponseFlowControlExpectation,
+	reservationReady, done <-chan struct{},
+) {
+	select {
+	case <-reservationReady:
+	case <-done:
+		return
+	}
+
+	writer, installed := frontend.installHTTPConnectResponseFlowControl(s, expected)
+	if !installed {
+		return
+	}
+	if frontend.httpWriterIsTerminal(writer) {
+		frontend.sendBackendCloseRequestAsync(s, string(httpConnectAbortSetupRace))
+		return
+	}
+
+	// Publish the exact connection before the writer starts so DATA can never
+	// observe an established HTTP connection without its writer and flow state.
+	s.addEstablished(expected.agentID, expected.connectID, frontend)
+	if frontend.httpWriterIsTerminal(writer) {
+		// Teardown raced publication and won before establishment. Do not leave a
+		// newly published terminal entry behind.
+		s.removeEstablishedIf(expected.agentID, expected.connectID, frontend)
+		writer.abort(httpConnectAbortSetupRace)
+		frontend.sendBackendCloseRequestAsync(s, string(httpConnectAbortSetupRace))
+		return
+	}
+
+	writer.start()
+}
+
 // route the packet back to the correct client
 func (s *ProxyServer) serveRecvBackend(backend *Backend, agentID string, recvCh <-chan *client.Packet) {
 	defer func() {
@@ -1171,7 +1206,37 @@ func (s *ProxyServer) serveRecvBackend(backend *Backend, agentID string, recvCh 
 				frontend.abortHTTP(s, httpConnectAbortFeatureMismatch)
 				break
 			}
-			frontend.httpConnectResponseMode = selectedResponseMode
+			frontend.setHTTPConnectResponseMode(selectedResponseMode)
+
+			if selectedResponseMode == httpConnectResponseModeAgentToServerByteWindowV1 {
+				admission, admissionStatus := s.httpConnectFlowControlAllocator.admit()
+				if admission == nil {
+					klog.V(2).InfoS("HTTP CONNECT response flow-control admission unavailable",
+						"dialID", resp.Random,
+						"agentID", agentID,
+						"connectionID", resp.ConnectID,
+						"admissionStatus", admissionStatus,
+					)
+					// The fixed admission-error writer is a later boundary. Until it
+					// is installed, fail closed without attaching the success writer.
+					frontend.abortHTTP(s, httpConnectAbortAdmissionFailed)
+					break
+				}
+				reservationReady, done, started := frontend.startHTTPConnectResponseFlowControlAdmission(admission)
+				if !started {
+					admission.releaseUnowned()
+					frontend.abortHTTP(s, httpConnectAbortSetupRace)
+					break
+				}
+				expected := httpConnectResponseFlowControlExpectation{
+					backend:   backend,
+					agentID:   agentID,
+					connectID: resp.ConnectID,
+					mode:      selectedResponseMode,
+				}
+				go s.continueHTTPConnectResponseFlowControlEstablishment(frontend, expected, reservationReady, done)
+				break
+			}
 
 			writer, attached := frontend.configuredHTTPWriter(s, true)
 			if !attached {

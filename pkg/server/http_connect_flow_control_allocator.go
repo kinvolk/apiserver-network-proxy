@@ -52,10 +52,9 @@ type httpConnectFlowControlReservation struct {
 // between allocator admission and later response-flow setup.
 // ProxyClientConnection.httpMu protects every field. reservationReady reports
 // only provisional resource ownership: the allocator's reservation value is
-// consumed exclusively by this slot. Before production wiring treats that
-// signal as admission success, it must revalidate the backend generation,
-// endpoint, and selected response mode in addition to the terminal-state check
-// performed here.
+// consumed exclusively by this slot. installHTTPConnectResponseFlowControl
+// revalidates frontend state, backend generation and context, endpoint
+// identity, and selected mode before transferring it into installed state.
 type httpConnectResponseFlowControlAdmissionState struct {
 	admission        *httpConnectFlowControlAdmission
 	reservation      *httpConnectFlowControlReservation
@@ -80,13 +79,45 @@ type httpConnectResponseFlowControlState struct {
 	consumedTotal uint64
 }
 
-// installHTTPConnectResponseFlowControl is an inert seam for the executable
-// contract that precedes the zero-credit establishment implementation.
 func (c *ProxyClientConnection) installHTTPConnectResponseFlowControl(
 	server *ProxyServer,
 	expected httpConnectResponseFlowControlExpectation,
 ) (*httpConnectWriter, bool) {
-	return nil, true
+	c.httpMu.Lock()
+	admissionState := c.httpResponseFlowControlAdmission
+	valid := !c.httpTerminal &&
+		expected.backend != nil &&
+		c.backend == expected.backend &&
+		expected.backend.Context().Err() == nil &&
+		expected.connectID != 0 &&
+		c.connectID == expected.connectID &&
+		c.agentID == expected.agentID &&
+		expected.mode == httpConnectResponseModeAgentToServerByteWindowV1 &&
+		c.httpConnectResponseMode == expected.mode &&
+		admissionState != nil &&
+		admissionState.reservation != nil &&
+		c.httpResponseFlowControl == nil &&
+		c.httpWriter == nil
+	if !valid {
+		c.httpMu.Unlock()
+		c.abortHTTP(server, httpConnectAbortSetupRace)
+		return nil, false
+	}
+
+	flowControlState := &httpConnectResponseFlowControlState{
+		reservation: admissionState.reservation,
+		done:        admissionState.done,
+		windowSize:  admissionState.reservation.allocator.windowSize,
+	}
+	admissionState.reservation = nil
+	c.httpResponseFlowControlAdmission = nil
+	c.httpResponseFlowControl = flowControlState
+
+	writer := newHTTPConnectWriter(server, c, c.httpInitialResponse, true)
+	c.httpInitialResponse = nil
+	c.httpWriter = writer
+	c.httpMu.Unlock()
+	return writer, true
 }
 
 func newHTTPConnectFlowControlAllocator(windowSize, poolSize int64, maxPendingAdmissions int) *httpConnectFlowControlAllocator {
@@ -121,6 +152,17 @@ func (a *httpConnectFlowControlAllocator) admit() (*httpConnectFlowControlAdmiss
 
 func (a *httpConnectFlowControlAdmission) reservationReady() <-chan *httpConnectFlowControlReservation {
 	return a.ready
+}
+
+// releaseUnowned returns an admission that was never transferred to a
+// connection. If cancellation loses, allocator assignment has already made
+// the reservation reachable on ready under the same allocator mutex.
+func (a *httpConnectFlowControlAdmission) releaseUnowned() {
+	if a.cancel() {
+		return
+	}
+	reservation := <-a.reservationReady()
+	reservation.release()
 }
 
 // startHTTPConnectResponseFlowControlAdmission transfers one allocator
@@ -217,16 +259,24 @@ func (c *ProxyClientConnection) receiveHTTPConnectResponseFlowControlReservation
 }
 
 // takeHTTPConnectResponseFlowControlTerminationLocked transfers terminal
-// cleanup ownership to the caller. A false admission cancellation means
-// allocator assignment won; the sole receiver remains responsible for
-// draining and releasing that reservation after observing httpTerminal.
+// cleanup ownership for either admission or installed zero-credit state to the
+// caller. A false admission cancellation means allocator assignment won; the
+// sole receiver remains responsible for draining and releasing that reservation
+// after observing httpTerminal.
 func (c *ProxyClientConnection) takeHTTPConnectResponseFlowControlTerminationLocked() (
 	reservation *httpConnectFlowControlReservation,
 	stopReceiver, done chan struct{},
 ) {
 	state := c.httpResponseFlowControlAdmission
 	if state == nil {
-		return nil, nil, nil
+		flowControlState := c.httpResponseFlowControl
+		if flowControlState == nil {
+			return nil, nil, nil
+		}
+		c.httpResponseFlowControl = nil
+		reservation = flowControlState.reservation
+		flowControlState.reservation = nil
+		return reservation, nil, flowControlState.done
 	}
 	if state.reservation != nil {
 		c.httpResponseFlowControlAdmission = nil

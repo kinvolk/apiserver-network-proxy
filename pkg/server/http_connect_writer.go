@@ -47,6 +47,7 @@ type httpConnectAbortReason string
 const (
 	httpConnectAbortBackendShutdown httpConnectAbortReason = "backend_shutdown"
 	httpConnectAbortDialClosed      httpConnectAbortReason = "dial_closed"
+	httpConnectAbortAdmissionFailed httpConnectAbortReason = "flow_control_admission_failed"
 	httpConnectAbortFeatureMismatch httpConnectAbortReason = "flow_control_feature_mismatch"
 	httpConnectAbortFrontendClose   httpConnectAbortReason = "frontend_close"
 	httpConnectAbortSetupRace       httpConnectAbortReason = "setup_race"
@@ -390,6 +391,12 @@ func (c *ProxyClientConnection) setHTTPConnectionDetails(agentID string, connect
 	c.httpMu.Lock()
 	c.agentID = agentID
 	c.connectID = connectID
+	c.httpMu.Unlock()
+}
+
+func (c *ProxyClientConnection) setHTTPConnectResponseMode(mode httpConnectResponseMode) {
+	c.httpMu.Lock()
+	c.httpConnectResponseMode = mode
 	c.httpMu.Unlock()
 }
 
