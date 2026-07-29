@@ -25,9 +25,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/mock/gomock"
 
 	client "sigs.k8s.io/apiserver-network-proxy/konnectivity-client/proto/client"
+	"sigs.k8s.io/apiserver-network-proxy/pkg/server/metrics"
 	"sigs.k8s.io/apiserver-network-proxy/pkg/server/proxystrategies"
 )
 
@@ -208,6 +210,85 @@ func TestHTTPConnectAcceptedResponseFlowControlEstablishesAtZeroCredit(t *testin
 		t.Fatal("terminal abort did not synchronously release production admission ownership")
 	}
 	assertHTTPConnectFlowControlAllocatorUsage(t, allocator, 0, 0)
+}
+
+func TestHTTPConnectResponseFlowControlEstablishmentObservesDialLatency(t *testing.T) {
+	const (
+		agentID    = "response-flow-dial-latency-agent"
+		connectID  = int64(6231)
+		windowSize = int64(32)
+	)
+
+	metrics.Metrics.Reset()
+	t.Cleanup(metrics.Metrics.Reset)
+
+	backend, _ := newWriterTestBackend(context.Background(), agentID)
+	server := newWriterTestServer()
+	frontend := newWriterTestImmediateHTTP()
+	connection := &ProxyClientConnection{
+		Mode:                    ModeHTTPConnect,
+		HTTP:                    frontend,
+		CloseHTTP:               frontend.close,
+		closed:                  make(chan struct{}),
+		connected:               make(chan struct{}),
+		start:                   time.Now(),
+		backend:                 backend,
+		agentID:                 agentID,
+		connectID:               connectID,
+		httpConnectResponseMode: httpConnectResponseModeAgentToServerByteWindowV1,
+		httpInitialResponse:     []byte(httpConnectSuccessResponse),
+	}
+	allocator := newHTTPConnectFlowControlAllocator(windowSize, windowSize, 0)
+	admission := requireHTTPConnectFlowControlAdmission(t, allocator, httpConnectFlowControlAdmissionGranted)
+	reservationReady, done, started := connection.startHTTPConnectResponseFlowControlAdmission(admission)
+	if !started {
+		t.Fatal("dial-latency fixture did not start admission ownership")
+	}
+	t.Cleanup(func() {
+		connection.abortHTTP(server, httpConnectAbortFrontendClose)
+		server.removeEstablishedIf(agentID, connectID, connection)
+		assertHTTPConnectFlowControlAllocatorUsage(t, allocator, 0, 0)
+	})
+
+	server.continueHTTPConnectResponseFlowControlEstablishment(
+		connection,
+		httpConnectResponseFlowControlExpectation{
+			backend:   backend,
+			agentID:   agentID,
+			connectID: connectID,
+			mode:      httpConnectResponseModeAgentToServerByteWindowV1,
+		},
+		reservationReady,
+		done,
+	)
+
+	if got := dialLatencySampleCount(t); got != 1 {
+		t.Fatalf("negotiated response-flow establishment dial-latency samples = %d, want 1", got)
+	}
+}
+
+func dialLatencySampleCount(t *testing.T) uint64 {
+	t.Helper()
+	metricFamilies, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+
+	const metricName = "konnectivity_network_proxy_server_dial_duration_seconds"
+	var count uint64
+	for _, family := range metricFamilies {
+		if family.GetName() != metricName {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			histogram := metric.GetHistogram()
+			if histogram == nil {
+				t.Fatalf("metric %s is not a histogram", metricName)
+			}
+			count += histogram.GetSampleCount()
+		}
+	}
+	return count
 }
 
 func TestHTTPConnectResponseFlowControlRevalidatesAssignedConnection(t *testing.T) {
