@@ -187,19 +187,23 @@ direction. A reconnect creates a new scope with counters starting at zero.
 
 ### Enablement
 
-The server and agent binaries each expose the startup-only boolean flag
---enable-http-connect-flow-control, default false. The server flag controls
-whether new backend streams offer response V1. The agent flag controls whether
-new client streams are willing to accept response V1. Both flags must be true
-for response V1 to be negotiated. When either flag is false, conforming peers
-use the unchanged legacy path and create no response flow-control state.
+The server binary exposes the startup-only boolean flag
+--enable-http-connect-flow-control. The agent binary exposes the startup-only
+boolean flag --enable-agent-server-data-flow-control. Both default false. The
+server flag controls whether new backend streams offer response V1 for HTTP
+CONNECT dials. The agent flag controls whether new client streams are willing
+to accept supported agent-server DATA flow-control features. Both flags must be
+true for response V1 to be negotiated. When either flag is false, conforming
+peers use the unchanged legacy path and create no response flow-control state.
 
-The flag name deliberately reserves one operator-facing control for HTTP
-CONNECT flow control. In this version it enables only agent-to-server response
-DATA flow control; server-to-agent request DATA remains legacy. Both binaries'
-flag descriptions state that limitation. A future request-direction protocol
-requires its own reviewed design and negotiation feature, but not another CLI
-enablement flag.
+The server flag deliberately reserves one operator-facing control for HTTP
+CONNECT flow control. The agent flag is frontend-neutral and reserves one
+operator-facing control for DATA flow control between the agent and proxy
+servers. In this version both enable only agent-to-server DATA flow control,
+which is response DATA for HTTP CONNECT; server-to-agent request DATA remains
+legacy. Both flags' descriptions state that limitation. A future
+request-direction protocol requires its own reviewed design and negotiation
+feature, but not another CLI enablement flag.
 
 Offer and acceptance policy are immutable for the process lifetime and are
 snapshotted for each new backend or client stream. Changing either flag
@@ -647,8 +651,9 @@ flow-control implementation must satisfy all six assertions together.
 
 ### Negotiation and compatibility tests
 
-- Both binaries register --enable-http-connect-flow-control with a false
-  default and a description that identifies the response-only limitation.
+- The server registers --enable-http-connect-flow-control and the agent
+  registers --enable-agent-server-data-flow-control. Both default false and
+  describe the current agent-to-server-only limitation.
 - A disabled server sends no offer; an enabled server offers exactly response
   V1. A disabled agent accepts nothing even when response V1 is offered.
 - Every compatibility-matrix pairing establishes, transfers DATA in both
@@ -969,8 +974,9 @@ safety behavior.
 
 ### Rollout and rollback
 
-1. Deploy both new binaries with --enable-http-connect-flow-control=false and
-   verify unchanged legacy dial and DATA behavior.
+1. Deploy the new server with --enable-http-connect-flow-control=false and the
+   new agent with --enable-agent-server-data-flow-control=false, then verify
+   unchanged legacy dial and DATA behavior.
 2. Enable the server flag first. Pre-feature and disabled agents ignore the
    additive offer and remain legacy without allocating flow-control resources.
 3. Verify legacy behavior and zero negotiated admission activity, then enable
