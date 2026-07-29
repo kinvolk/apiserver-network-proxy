@@ -414,6 +414,70 @@ func TestHTTPConnectResponseFlowControlAdmissionRefusalFailsClosed(t *testing.T)
 	}
 }
 
+func TestHTTPConnectResponseFlowControlRejectsZeroConnectionID(t *testing.T) {
+	const windowSize = int64(32)
+
+	fixture := newHTTPConnectFlowControlDialFixtureWithBlockedHTTPWrite(t, true)
+	fixture.proxyServer.SetHTTPConnectFlowControlConfig(windowSize, windowSize, 1, time.Second)
+	allocator := fixture.proxyServer.httpConnectFlowControlAllocator
+	offered := slices.Clone(fixture.dialRequest.GetOfferedFlowControlFeatures())
+
+	consumer := startWriterTestBackendConsumer(t, fixture.proxyServer, fixture.backend, fixture.agentID, 1)
+	consumer.recvCh <- &client.Packet{
+		Type: client.PacketType_DIAL_RSP,
+		Payload: &client.Packet_DialResponse{
+			DialResponse: &client.DialResponse{
+				Random:                      fixture.dialRequest.GetRandom(),
+				ConnectID:                   0,
+				AcceptedFlowControlFeatures: offered,
+			},
+		},
+	}
+
+	select {
+	case <-fixture.frontendConn.sink.closeObserved:
+	case <-fixture.frontendConn.sink.firstWriteStarted:
+		t.Fatal("response V1 with zero connection ID started HTTP 200")
+	case <-fixture.pending.connected:
+		t.Fatal("response V1 with zero connection ID signaled connected")
+	case <-time.After(writerTestSafetyTimeout):
+		t.Fatal("response V1 with zero connection ID did not converge to terminal state")
+	}
+	consumer.stop(t)
+
+	fixture.pending.httpMu.Lock()
+	writer := fixture.pending.httpWriter
+	admissionState := fixture.pending.httpResponseFlowControlAdmission
+	flowControlState := fixture.pending.httpResponseFlowControl
+	terminal := fixture.pending.httpTerminal
+	fixture.pending.httpMu.Unlock()
+	if !terminal {
+		t.Fatal("response V1 with zero connection ID left the claimed connection non-terminal")
+	}
+	if writer != nil || admissionState != nil || flowControlState != nil {
+		t.Fatalf("zero-connection-ID resources = (%p, %p, %p), want (nil, nil, nil)", writer, admissionState, flowControlState)
+	}
+	assertHTTPConnectFlowControlAllocatorUsage(t, allocator, 0, 0)
+
+	written, _, _, _ := fixture.frontendConn.sink.snapshot()
+	if len(written) != 0 {
+		t.Fatalf("response V1 with zero connection ID wrote HTTP response %q, want none", written)
+	}
+	select {
+	case <-fixture.pending.connected:
+		t.Fatal("response V1 with zero connection ID signaled connected")
+	default:
+	}
+	if _, err := fixture.proxyServer.getFrontend(fixture.agentID, 0); err == nil {
+		t.Fatal("response V1 with zero connection ID published an established connection")
+	}
+	select {
+	case got := <-fixture.backendCloseRequests:
+		t.Fatalf("response V1 with zero connection ID sent CLOSE_REQ for connection %d", got)
+	default:
+	}
+}
+
 func TestHTTPConnectResponseFlowControlRevalidatesAssignedConnection(t *testing.T) {
 	const (
 		agentID    = "response-flow-revalidation-agent"
