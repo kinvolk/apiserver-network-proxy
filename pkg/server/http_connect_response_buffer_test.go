@@ -110,6 +110,41 @@ func TestHTTPConnectResponseBufferReusesStorageForOneByteFrames(t *testing.T) {
 	}
 }
 
+func TestHTTPConnectResponseBufferKeepsPeekedSpanDisjointFromWrappedEnqueue(t *testing.T) {
+	buffer := newHTTPConnectResponseBuffer(8)
+	if !buffer.enqueue([]byte("abcdef")) {
+		t.Fatal("wrapped-enqueue fixture rejected its initial bytes")
+	}
+	if !buffer.consume(4) {
+		t.Fatal("wrapped-enqueue fixture rejected its initial consumption")
+	}
+
+	held, wait, open := buffer.peek()
+	if !open || wait != nil || !bytes.Equal(held, []byte("ef")) {
+		t.Fatalf("response buffer held span = (%q, %p, %v), want (ef, nil, true)", held, wait, open)
+	}
+	if cap(held) != len(held) {
+		t.Fatalf("response buffer peek capacity = %d, want bounded length %d", cap(held), len(held))
+	}
+
+	enqueued := make(chan bool, 1)
+	go func() {
+		enqueued <- buffer.enqueue([]byte("ghijkl"))
+	}()
+	if !<-enqueued {
+		t.Fatal("response buffer rejected bytes that deterministically wrap around the held span")
+	}
+	if !bytes.Equal(held, []byte("ef")) {
+		t.Fatalf("response buffer held span changed across wrapped enqueue to %q, want %q", held, "ef")
+	}
+
+	assertHTTPConnectResponseBufferHead(t, buffer, "efgh")
+	if !buffer.consume(4) {
+		t.Fatal("response buffer rejected consumption through the wrapped head")
+	}
+	assertHTTPConnectResponseBufferHead(t, buffer, "ijkl")
+}
+
 func TestHTTPConnectResponseBufferLinearizesProducerAndConsumer(t *testing.T) {
 	const halfWindow = 32
 
