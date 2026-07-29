@@ -18,6 +18,7 @@ package server
 
 import (
 	"bytes"
+	"sync"
 	"testing"
 )
 
@@ -106,6 +107,49 @@ func TestHTTPConnectResponseBufferReusesStorageForOneByteFrames(t *testing.T) {
 	}
 	if allocations != 0 {
 		t.Fatalf("response buffer one-byte cycles allocated %.0f objects, want 0 queue-node growth", allocations)
+	}
+}
+
+func TestHTTPConnectResponseBufferLinearizesProducerAndConsumer(t *testing.T) {
+	const halfWindow = 32
+
+	buffer := newHTTPConnectResponseBuffer(2 * halfWindow)
+	if !buffer.enqueue(bytes.Repeat([]byte{0}, halfWindow)) {
+		t.Fatal("concurrent response buffer fixture rejected its initial half-window")
+	}
+
+	for generation := byte(1); generation <= 64; generation++ {
+		next := bytes.Repeat([]byte{generation}, halfWindow)
+		start := make(chan struct{})
+		results := make(chan bool, 2)
+		var workers sync.WaitGroup
+		workers.Add(2)
+		go func() {
+			defer workers.Done()
+			<-start
+			results <- buffer.enqueue(next)
+		}()
+		go func() {
+			defer workers.Done()
+			<-start
+			results <- buffer.consume(halfWindow)
+		}()
+		close(start)
+		workers.Wait()
+		close(results)
+		for ok := range results {
+			if !ok {
+				t.Fatalf("response buffer rejected a valid producer/consumer transition at generation %d", generation)
+			}
+		}
+
+		if got := buffer.bufferedBytes(); got != halfWindow {
+			t.Fatalf("response buffer occupancy at generation %d = %d, want %d", generation, got, halfWindow)
+		}
+		data, wait, open := buffer.peek()
+		if !open || wait != nil || !bytes.Equal(data, next) {
+			t.Fatalf("response buffer head at generation %d = (%x, %p, %v), want (%x, nil, true)", generation, data, wait, open, next)
+		}
 	}
 }
 
