@@ -1071,6 +1071,14 @@ func (s *ProxyServer) continueHTTPConnectResponseFlowControlEstablishment(
 	}
 
 	writer.start()
+	metrics.Metrics.ObserveDialLatency(time.Since(frontend.start))
+	klog.V(3).InfoS("Proxy connection established",
+		"dialID", frontend.dialID,
+		"connectionID", expected.connectID,
+		"agentID", expected.agentID,
+		"dialAddress", frontend.dialAddress,
+		"dialDuration", time.Since(frontend.start),
+	)
 }
 
 // route the packet back to the correct client
