@@ -57,10 +57,10 @@ func TestHTTPConnectResponseFlowControlWaitsForInitialGrant(t *testing.T) {
 	clientStream, serverStream := pipe()
 	dialResponseObserved := make(chan responseFlowControlDialObservation, 1)
 	testClient := &Client{
-		connManager:                  newConnectionManager(),
-		stopCh:                       stopCh,
-		cs:                           clientSet,
-		enableHTTPConnectFlowControl: true,
+		connManager:                      newConnectionManager(),
+		stopCh:                           stopCh,
+		cs:                               clientSet,
+		enableAgentServerDataFlowControl: true,
 		dialEndpoint: func(_, _ string, _ time.Duration) (net.Conn, error) {
 			return observedEndpoint, nil
 		},
@@ -217,12 +217,12 @@ func TestHTTPConnectResponseFlowControlFramesEOFBytesBeforeClose(t *testing.T) {
 	}
 	clientStream, serverStream := pipe()
 	testClient := &Client{
-		connManager:                  newConnectionManager(),
-		stopCh:                       stopCh,
-		cs:                           clientSet,
-		stream:                       clientStream,
-		probeInterval:                time.Hour,
-		enableHTTPConnectFlowControl: true,
+		connManager:                      newConnectionManager(),
+		stopCh:                           stopCh,
+		cs:                               clientSet,
+		stream:                           clientStream,
+		probeInterval:                    time.Hour,
+		enableAgentServerDataFlowControl: true,
 		dialEndpoint: func(_, _ string, _ time.Duration) (net.Conn, error) {
 			return endpoint, nil
 		},
@@ -454,10 +454,10 @@ func TestHTTPConnectResponseFlowControlRequiresOffer(t *testing.T) {
 	clientStream, serverStream := pipe()
 	dialResponseObserved := make(chan responseFlowControlDialObservation, 1)
 	testClient := &Client{
-		connManager:                  newConnectionManager(),
-		stopCh:                       stopCh,
-		cs:                           clientSet,
-		enableHTTPConnectFlowControl: true,
+		connManager:                      newConnectionManager(),
+		stopCh:                           stopCh,
+		cs:                               clientSet,
+		enableAgentServerDataFlowControl: true,
 		dialEndpoint: func(_, _ string, _ time.Duration) (net.Conn, error) {
 			return endpoint, nil
 		},

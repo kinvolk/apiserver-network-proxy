@@ -158,9 +158,9 @@ type Client struct {
 
 	cs *ClientSet // the clientset that includes this AgentClient.
 
-	// Immutable HTTP-CONNECT flow-control acceptance policy for this client
-	// stream.
-	enableHTTPConnectFlowControl bool
+	// Immutable agent-server DATA flow-control acceptance policy for this
+	// client stream.
+	enableAgentServerDataFlowControl bool
 
 	stream           agent.AgentService_ConnectClient
 	agentID          string
@@ -214,7 +214,7 @@ func newUnconnectedAgentClient(address, agentID, agentIdentifiers string, cs *Cl
 		connManager:             newConnectionManager(),
 		warnOnChannelLimit:      cs.warnOnChannelLimit,
 
-		enableHTTPConnectFlowControl: cs.enableHTTPConnectFlowControl,
+		enableAgentServerDataFlowControl: cs.enableAgentServerDataFlowControl,
 	}
 }
 
@@ -534,7 +534,7 @@ func (a *Client) Serve() {
 				metrics.Metrics.ObserveDialLatency(time.Since(start))
 				klog.V(3).InfoS("Endpoint connection established", "dialID", dialReq.Random, "connectionID", connID, "dialAddress", dialReq.Address)
 				eConn.conn = conn
-				if a.enableHTTPConnectFlowControl && offeredAgentToServerFlowControlV1(dialReq.GetOfferedFlowControlFeatures()) {
+				if a.enableAgentServerDataFlowControl && offeredAgentToServerFlowControlV1(dialReq.GetOfferedFlowControlFeatures()) {
 					eConn.responseFlowControl = newAgentToServerFlowControlState()
 					dialResp.GetDialResponse().AcceptedFlowControlFeatures = []client.FlowControlFeature{
 						client.FlowControlFeature_AGENT_TO_SERVER_BYTE_WINDOW_V1,

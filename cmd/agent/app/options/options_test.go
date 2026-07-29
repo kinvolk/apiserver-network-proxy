@@ -83,7 +83,7 @@ func TestAgentServerDataFlowControlFlag(t *testing.T) {
 	}
 }
 
-func TestHTTPConnectFlowControlPolicyReachesClientSetConfig(t *testing.T) {
+func TestAgentServerDataFlowControlPolicyReachesClientSetConfig(t *testing.T) {
 	tests := []struct {
 		name    string
 		enabled bool
@@ -95,12 +95,12 @@ func TestHTTPConnectFlowControlPolicyReachesClientSetConfig(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			options := NewGrpcProxyAgentOptions()
-			options.EnableHTTPConnectFlowControl = tt.enabled
+			options.EnableAgentServerDataFlowControl = tt.enabled
 			config := options.ClientSetConfig()
 
-			options.EnableHTTPConnectFlowControl = !tt.enabled
-			if got := config.EnableHTTPConnectFlowControl; got != tt.enabled {
-				t.Fatalf("client-set config HTTP-CONNECT flow-control policy = %t, want snapshotted %t from agent options", got, tt.enabled)
+			options.EnableAgentServerDataFlowControl = !tt.enabled
+			if got := config.EnableAgentServerDataFlowControl; got != tt.enabled {
+				t.Fatalf("client-set config agent-server DATA flow-control policy = %t, want snapshotted %t from agent options", got, tt.enabled)
 			}
 		})
 	}

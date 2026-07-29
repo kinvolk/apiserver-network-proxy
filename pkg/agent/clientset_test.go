@@ -119,7 +119,7 @@ func TestResponseBasedCounter(t *testing.T) {
 	}
 }
 
-func TestHTTPConnectFlowControlPolicyIsSnapshotted(t *testing.T) {
+func TestAgentServerDataFlowControlPolicyIsSnapshotted(t *testing.T) {
 	tests := []struct {
 		name    string
 		enabled bool
@@ -131,22 +131,22 @@ func TestHTTPConnectFlowControlPolicyIsSnapshotted(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Run("client set captures config", func(t *testing.T) {
-				config := &ClientSetConfig{EnableHTTPConnectFlowControl: tt.enabled}
+				config := &ClientSetConfig{EnableAgentServerDataFlowControl: tt.enabled}
 				clientSet := config.NewAgentClientSet(nil, nil)
 
-				config.EnableHTTPConnectFlowControl = !tt.enabled
-				if got := clientSet.enableHTTPConnectFlowControl; got != tt.enabled {
-					t.Fatalf("client-set HTTP-CONNECT flow-control policy = %t, want snapshotted %t", got, tt.enabled)
+				config.EnableAgentServerDataFlowControl = !tt.enabled
+				if got := clientSet.enableAgentServerDataFlowControl; got != tt.enabled {
+					t.Fatalf("client-set agent-server DATA flow-control policy = %t, want snapshotted %t", got, tt.enabled)
 				}
 			})
 
 			t.Run("client stream captures client set", func(t *testing.T) {
-				clientSet := &ClientSet{enableHTTPConnectFlowControl: tt.enabled}
+				clientSet := &ClientSet{enableAgentServerDataFlowControl: tt.enabled}
 				client := newUnconnectedAgentClient("", "", "", clientSet)
 
-				clientSet.enableHTTPConnectFlowControl = !tt.enabled
-				if got := client.enableHTTPConnectFlowControl; got != tt.enabled {
-					t.Fatalf("client-stream HTTP-CONNECT flow-control policy = %t, want snapshotted %t", got, tt.enabled)
+				clientSet.enableAgentServerDataFlowControl = !tt.enabled
+				if got := client.enableAgentServerDataFlowControl; got != tt.enabled {
+					t.Fatalf("client-stream agent-server DATA flow-control policy = %t, want snapshotted %t", got, tt.enabled)
 				}
 			})
 		})

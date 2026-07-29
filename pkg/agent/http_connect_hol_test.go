@@ -99,15 +99,15 @@ func TestHTTPConnectResponseFlowControlPreventsHeadOfLineBlocking(t *testing.T) 
 		xfrChannelSize: 1,
 	}
 	testClient := &Client{
-		connManager:                  newConnectionManager(),
-		cs:                           clientSet,
-		stream:                       stream.client(),
-		agentID:                      agentID,
-		serverID:                     "primary-hol-server",
-		drainCh:                      make(chan struct{}),
-		stopCh:                       make(chan struct{}),
-		probeInterval:                time.Hour,
-		enableHTTPConnectFlowControl: true,
+		connManager:                      newConnectionManager(),
+		cs:                               clientSet,
+		stream:                           stream.client(),
+		agentID:                          agentID,
+		serverID:                         "primary-hol-server",
+		drainCh:                          make(chan struct{}),
+		stopCh:                           make(chan struct{}),
+		probeInterval:                    time.Hour,
+		enableAgentServerDataFlowControl: true,
 		dialEndpoint: func(_, address string, _ time.Duration) (net.Conn, error) {
 			endpointMu.Lock()
 			defer endpointMu.Unlock()

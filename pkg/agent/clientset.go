@@ -90,7 +90,7 @@ type ClientSet struct {
 	xfrChannelSize     int
 
 	// Immutable startup policy copied onto each new client stream.
-	enableHTTPConnectFlowControl bool
+	enableAgentServerDataFlowControl bool
 
 	// serverCountSource controls how we compute the server count.
 	// The proxy server sends the serverCount header to each connecting agent,
@@ -179,7 +179,7 @@ type ClientSetConfig struct {
 	XfrChannelSize          int
 	ServerCountSource       string
 
-	EnableHTTPConnectFlowControl bool
+	EnableAgentServerDataFlowControl bool
 }
 
 func (cc *ClientSetConfig) NewAgentClientSet(drainCh, stopCh <-chan struct{}) *ClientSet {
@@ -200,7 +200,7 @@ func (cc *ClientSetConfig) NewAgentClientSet(drainCh, stopCh <-chan struct{}) *C
 		stopCh:                  stopCh,
 		serverCountSource:       cc.ServerCountSource,
 
-		enableHTTPConnectFlowControl: cc.EnableHTTPConnectFlowControl,
+		enableAgentServerDataFlowControl: cc.EnableAgentServerDataFlowControl,
 	}
 }
 

@@ -42,10 +42,10 @@ func TestServeData_HTTP(t *testing.T) {
 		stopCh:  stopCh,
 	}
 	testClient := &Client{
-		connManager:                  newConnectionManager(),
-		stopCh:                       stopCh,
-		cs:                           cs,
-		enableHTTPConnectFlowControl: false,
+		connManager:                      newConnectionManager(),
+		stopCh:                           stopCh,
+		cs:                               cs,
+		enableAgentServerDataFlowControl: false,
 	}
 	testClient.stream, stream = pipe()
 
