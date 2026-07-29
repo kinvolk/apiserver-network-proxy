@@ -153,6 +153,45 @@ func TestHTTPConnectResponseBufferLinearizesProducerAndConsumer(t *testing.T) {
 	}
 }
 
+func TestHTTPConnectResponseBufferLinearizesEnqueueWithClose(t *testing.T) {
+	for iteration := 0; iteration < 64; iteration++ {
+		buffer := newHTTPConnectResponseBuffer(1)
+		start := make(chan struct{})
+		enqueued := make(chan bool, 1)
+		var workers sync.WaitGroup
+		workers.Add(2)
+		go func() {
+			defer workers.Done()
+			<-start
+			enqueued <- buffer.enqueue([]byte{1})
+		}()
+		go func() {
+			defer workers.Done()
+			<-start
+			buffer.close()
+		}()
+		close(start)
+		workers.Wait()
+
+		if <-enqueued {
+			data, wait, open := buffer.peek()
+			if !open || wait != nil || !bytes.Equal(data, []byte{1}) {
+				t.Fatalf("enqueue-winning close race %d peek = (%x, %p, %v), want (01, nil, true)", iteration, data, wait, open)
+			}
+			if !buffer.consume(1) {
+				t.Fatalf("enqueue-winning close race %d rejected its accepted byte", iteration)
+			}
+		}
+
+		if data, wait, open := buffer.peek(); len(data) != 0 || wait != nil || open {
+			t.Fatalf("converged enqueue/close race %d peek = (%x, %p, %v), want (empty, nil, false)", iteration, data, wait, open)
+		}
+		if buffer.enqueue([]byte{2}) {
+			t.Fatalf("converged enqueue/close race %d accepted a post-close byte", iteration)
+		}
+	}
+}
+
 func TestHTTPConnectResponseBufferCloseWakesAndDrains(t *testing.T) {
 	buffer := newHTTPConnectResponseBuffer(4)
 	dataReady := requireEmptyHTTPConnectResponseBuffer(t, buffer)
