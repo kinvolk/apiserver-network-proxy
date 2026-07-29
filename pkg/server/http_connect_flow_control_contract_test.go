@@ -54,10 +54,21 @@ func TestHTTPConnectDialDoesNotOfferFlowControlWhenDisabled(t *testing.T) {
 	}
 }
 
-func TestHTTPConnectAcceptsOfferedResponseFlowControl(t *testing.T) {
-	const connectID = int64(6201)
+func TestHTTPConnectAcceptedResponseFlowControlOwnsAdmissionBeforeEstablishment(t *testing.T) {
+	const (
+		connectID  = int64(6201)
+		windowSize = int64(32)
+	)
 
 	fixture := newHTTPConnectFlowControlDialFixture(t, true)
+	fixture.proxyServer.SetHTTPConnectFlowControlConfig(windowSize, windowSize, 1, time.Second)
+	allocator := fixture.proxyServer.httpConnectFlowControlAllocator
+	holder := requireHTTPConnectFlowControlReservation(
+		t,
+		requireHTTPConnectFlowControlAdmission(t, allocator, httpConnectFlowControlAdmissionGranted),
+	)
+	t.Cleanup(holder.release)
+
 	want := []client.FlowControlFeature{
 		client.FlowControlFeature_AGENT_TO_SERVER_BYTE_WINDOW_V1,
 	}
@@ -78,19 +89,93 @@ func TestHTTPConnectAcceptsOfferedResponseFlowControl(t *testing.T) {
 		},
 	}
 
-	select {
-	case <-fixture.pending.connected:
-	case <-time.After(writerTestSafetyTimeout):
-		t.Fatal("server did not establish DIAL_RSP accepting the recorded offer")
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	timer := time.NewTimer(writerTestSafetyTimeout)
+	defer timer.Stop()
+	for {
+		reservedBytes, pendingAdmissions := allocator.usage()
+		if reservedBytes == windowSize && pendingAdmissions == 1 {
+			break
+		}
+		select {
+		case <-fixture.pending.connected:
+			t.Fatal("response V1 signaled connected before flow-control admission ownership")
+		case <-fixture.frontendConn.sink.closeObserved:
+			t.Fatal("response V1 closed the frontend instead of joining flow-control admission")
+		case <-ticker.C:
+		case <-timer.C:
+			t.Fatalf("response V1 allocator usage = (%d, %d), want (%d, 1)", reservedBytes, pendingAdmissions, windowSize)
+		}
 	}
 
+	fixture.pending.httpMu.Lock()
+	state := fixture.pending.httpResponseFlowControlAdmission
+	writer := fixture.pending.httpWriter
+	started := fixture.pending.httpResponseFlowControlStarted
+	selectedMode := fixture.pending.httpConnectResponseMode
+	fixture.pending.httpMu.Unlock()
+	if !started || state == nil {
+		t.Fatalf("response V1 admission ownership = (%v, %p), want (true, non-nil)", started, state)
+	}
+	if writer != nil {
+		t.Fatalf("queued response V1 attached HTTP writer %p before admission", writer)
+	}
+	if selectedMode != httpConnectResponseModeAgentToServerByteWindowV1 {
+		t.Fatalf("queued connection response mode = %q, want %q", selectedMode, httpConnectResponseModeAgentToServerByteWindowV1)
+	}
+	select {
+	case <-fixture.pending.connected:
+		t.Fatal("queued response V1 signaled connected")
+	default:
+	}
 	written, _, _, _ := fixture.frontendConn.sink.snapshot()
-	if !bytes.Equal(written, []byte(httpConnectSuccessResponse)) {
-		t.Fatalf("valid accepted DIAL_RSP wrote %q, want complete successful CONNECT response", written)
+	if len(written) != 0 {
+		t.Fatalf("queued response V1 wrote HTTP response %q, want none", written)
 	}
-	if got, err := fixture.proxyServer.getFrontend(fixture.agentID, connectID); err != nil || got != fixture.pending {
-		t.Fatalf("established connection = %p, %v; want %p", got, err, fixture.pending)
+	if _, err := fixture.proxyServer.getFrontend(fixture.agentID, connectID); err == nil {
+		t.Fatal("queued response V1 published an established connection")
 	}
+
+	holder.release()
+	select {
+	case <-state.reservationReady:
+	case <-time.After(writerTestSafetyTimeout):
+		t.Fatal("queued response V1 did not receive released flow-control capacity")
+	}
+	select {
+	case <-state.done:
+		t.Fatal("assigned response V1 became terminal while the connection remained live")
+	default:
+	}
+	assertHTTPConnectFlowControlAllocatorUsage(t, allocator, windowSize, 0)
+	fixture.pending.httpMu.Lock()
+	ownedReservation := state.reservation
+	writer = fixture.pending.httpWriter
+	fixture.pending.httpMu.Unlock()
+	if ownedReservation == nil {
+		t.Fatal("assigned response V1 did not retain its connection-owned reservation")
+	}
+	if writer != nil {
+		t.Fatalf("assigned response V1 attached HTTP writer %p before response-flow setup", writer)
+	}
+	select {
+	case <-fixture.pending.connected:
+		t.Fatal("assigned response V1 signaled connected before response-flow setup")
+	default:
+	}
+	written, _, _, _ = fixture.frontendConn.sink.snapshot()
+	if len(written) != 0 {
+		t.Fatalf("assigned response V1 wrote HTTP response %q, want none", written)
+	}
+
+	fixture.pending.abortHTTP(fixture.proxyServer, httpConnectAbortFrontendClose)
+	select {
+	case <-state.done:
+	default:
+		t.Fatal("terminal abort did not synchronously release production admission ownership")
+	}
+	assertHTTPConnectFlowControlAllocatorUsage(t, allocator, 0, 0)
 }
 
 func TestHTTPConnectEnforcesResponseFlowControlMode(t *testing.T) {
