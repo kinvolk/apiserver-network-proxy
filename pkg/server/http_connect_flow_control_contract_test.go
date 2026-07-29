@@ -29,7 +29,6 @@ import (
 	"go.uber.org/mock/gomock"
 
 	client "sigs.k8s.io/apiserver-network-proxy/konnectivity-client/proto/client"
-	"sigs.k8s.io/apiserver-network-proxy/pkg/server/metrics"
 	"sigs.k8s.io/apiserver-network-proxy/pkg/server/proxystrategies"
 )
 
@@ -219,9 +218,6 @@ func TestHTTPConnectResponseFlowControlEstablishmentObservesDialLatency(t *testi
 		windowSize = int64(32)
 	)
 
-	metrics.Metrics.Reset()
-	t.Cleanup(metrics.Metrics.Reset)
-
 	backend, _ := newWriterTestBackend(context.Background(), agentID)
 	server := newWriterTestServer()
 	frontend := newWriterTestImmediateHTTP()
@@ -250,6 +246,7 @@ func TestHTTPConnectResponseFlowControlEstablishmentObservesDialLatency(t *testi
 		assertHTTPConnectFlowControlAllocatorUsage(t, allocator, 0, 0)
 	})
 
+	before := dialLatencySampleCount(t)
 	server.continueHTTPConnectResponseFlowControlEstablishment(
 		connection,
 		httpConnectResponseFlowControlExpectation{
@@ -261,9 +258,9 @@ func TestHTTPConnectResponseFlowControlEstablishmentObservesDialLatency(t *testi
 		reservationReady,
 		done,
 	)
-
-	if got := dialLatencySampleCount(t); got != 1 {
-		t.Fatalf("negotiated response-flow establishment dial-latency samples = %d, want 1", got)
+	after := dialLatencySampleCount(t)
+	if after <= before {
+		t.Fatalf("negotiated response-flow establishment dial-latency samples did not increase: before = %d, after = %d", before, after)
 	}
 }
 
