@@ -471,6 +471,10 @@ func TestHTTPConnectResponseFlowControlRejectsZeroConnectionID(t *testing.T) {
 	if _, err := fixture.proxyServer.getFrontend(fixture.agentID, 0); err == nil {
 		t.Fatal("response V1 with zero connection ID published an established connection")
 	}
+	// Synchronize this negative assertion through closeRequestOnce. If either
+	// terminal cleanup or this direct attempt can send a zero-ID close, the send
+	// completes before this call returns.
+	fixture.pending.sendBackendCloseRequest(fixture.proxyServer, "zero connection ID test")
 	select {
 	case got := <-fixture.backendCloseRequests:
 		t.Fatalf("response V1 with zero connection ID sent CLOSE_REQ for connection %d", got)
