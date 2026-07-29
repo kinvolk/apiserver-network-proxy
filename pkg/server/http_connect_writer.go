@@ -330,13 +330,14 @@ func (c *ProxyClientConnection) configuredHTTPWriter(server *ProxyServer, notify
 func (c *ProxyClientConnection) markHTTPWriterTerminal(expected *httpConnectWriter) {
 	c.httpMu.Lock()
 	var reservation *httpConnectFlowControlReservation
+	var responseBuffer *httpConnectResponseBuffer
 	var stopReceiver, done chan struct{}
 	if expected == nil || c.httpWriter == expected {
 		c.httpTerminal = true
-		reservation, stopReceiver, done = c.takeHTTPConnectResponseFlowControlTerminationLocked()
+		reservation, responseBuffer, stopReceiver, done = c.takeHTTPConnectResponseFlowControlTerminationLocked()
 	}
 	c.httpMu.Unlock()
-	finishHTTPConnectResponseFlowControlTermination(reservation, stopReceiver, done)
+	finishHTTPConnectResponseFlowControlTermination(reservation, responseBuffer, stopReceiver, done)
 }
 
 func (c *ProxyClientConnection) httpWriterIsTerminal(expected *httpConnectWriter) bool {
@@ -349,9 +350,9 @@ func (c *ProxyClientConnection) abortHTTP(server *ProxyServer, reason httpConnec
 	c.httpMu.Lock()
 	c.httpTerminal = true
 	w := c.httpWriter
-	reservation, stopReceiver, done := c.takeHTTPConnectResponseFlowControlTerminationLocked()
+	reservation, responseBuffer, stopReceiver, done := c.takeHTTPConnectResponseFlowControlTerminationLocked()
 	c.httpMu.Unlock()
-	finishHTTPConnectResponseFlowControlTermination(reservation, stopReceiver, done)
+	finishHTTPConnectResponseFlowControlTermination(reservation, responseBuffer, stopReceiver, done)
 
 	if w != nil {
 		w.abort(reason)

@@ -107,10 +107,12 @@ func (c *ProxyClientConnection) installHTTPConnectResponseFlowControl(
 		return nil, false
 	}
 
+	windowSize := admissionState.reservation.allocator.windowSize
 	flowControlState := &httpConnectResponseFlowControlState{
 		reservation: admissionState.reservation,
+		buffer:      newHTTPConnectResponseBuffer(windowSize),
 		done:        admissionState.done,
-		windowSize:  admissionState.reservation.allocator.windowSize,
+		windowSize:  windowSize,
 	}
 	admissionState.reservation = nil
 	c.httpResponseFlowControlAdmission = nil
@@ -222,7 +224,7 @@ func (c *ProxyClientConnection) startHTTPConnectResponseFlowControlAdmission(
 	}
 	c.httpMu.Unlock()
 
-	finishHTTPConnectResponseFlowControlTermination(reservationToRelease, stopReceiver, flowControlDone)
+	finishHTTPConnectResponseFlowControlTermination(reservationToRelease, nil, stopReceiver, flowControlDone)
 	if receiveReservation {
 		go c.receiveHTTPConnectResponseFlowControlReservation(state, reservationSource)
 	}
@@ -268,39 +270,48 @@ func (c *ProxyClientConnection) receiveHTTPConnectResponseFlowControlReservation
 // after observing httpTerminal.
 func (c *ProxyClientConnection) takeHTTPConnectResponseFlowControlTerminationLocked() (
 	reservation *httpConnectFlowControlReservation,
+	responseBuffer *httpConnectResponseBuffer,
 	stopReceiver, done chan struct{},
 ) {
 	state := c.httpResponseFlowControlAdmission
 	if state == nil {
 		flowControlState := c.httpResponseFlowControl
 		if flowControlState == nil {
-			return nil, nil, nil
+			return nil, nil, nil, nil
 		}
 		c.httpResponseFlowControl = nil
 		reservation = flowControlState.reservation
 		flowControlState.reservation = nil
-		return reservation, nil, flowControlState.done
+		responseBuffer = flowControlState.buffer
+		flowControlState.buffer = nil
+		return reservation, responseBuffer, nil, flowControlState.done
 	}
 	if state.reservation != nil {
 		c.httpResponseFlowControlAdmission = nil
 		reservation = state.reservation
 		state.reservation = nil
-		return reservation, nil, state.done
+		return reservation, nil, nil, state.done
 	}
 	if state.admission != nil && state.admission.cancel() {
 		c.httpResponseFlowControlAdmission = nil
 		state.admission = nil
-		return nil, state.stopReceiver, state.done
+		return nil, nil, state.stopReceiver, state.done
 	}
-	return nil, nil, nil
+	return nil, nil, nil, nil
 }
 
 func finishHTTPConnectResponseFlowControlTermination(
 	reservation *httpConnectFlowControlReservation,
+	responseBuffer *httpConnectResponseBuffer,
 	stopReceiver, done chan struct{},
 ) {
 	if stopReceiver != nil {
 		close(stopReceiver)
+	}
+	// Stop this connection from accepting bytes before W can transfer to a
+	// different connection. done remains last so it witnesses both transitions.
+	if responseBuffer != nil {
+		responseBuffer.close()
 	}
 	if reservation != nil {
 		reservation.release()
