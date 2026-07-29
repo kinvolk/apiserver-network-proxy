@@ -32,7 +32,7 @@ import (
 
 const agentFlowControlTestSafetyTimeout = 5 * time.Second
 
-func TestHTTPConnectResponseFlowControlWaitsForInitialGrant(t *testing.T) {
+func TestAgentServerDataFlowControlWaitsForInitialGrant(t *testing.T) {
 	const (
 		dialID   = int64(7101)
 		target   = "flow-control-endpoint.invalid:443"
@@ -190,7 +190,7 @@ func TestHTTPConnectResponseFlowControlWaitsForInitialGrant(t *testing.T) {
 	waitForConnectionDeletion(t, testClient, dialResponse.GetConnectID())
 }
 
-func TestHTTPConnectResponseFlowControlFramesEOFBytesBeforeClose(t *testing.T) {
+func TestAgentServerDataFlowControlFramesEOFBytesBeforeClose(t *testing.T) {
 	const (
 		dialID   = int64(7103)
 		target   = "flow-control-eof-endpoint.invalid:443"
@@ -306,7 +306,7 @@ func TestHTTPConnectResponseFlowControlFramesEOFBytesBeforeClose(t *testing.T) {
 	}
 }
 
-func TestHTTPConnectResponseFlowControlCommitsBeforeQueuePublication(t *testing.T) {
+func TestAgentServerDataFlowControlCommitsBeforeQueuePublication(t *testing.T) {
 	const connectID = int64(7104)
 	firstPayload := []byte("first response payload")
 	queuedPayload := []byte("queued response payload")
@@ -435,7 +435,7 @@ func TestHTTPConnectResponseFlowControlCommitsBeforeQueuePublication(t *testing.
 	}
 }
 
-func TestHTTPConnectResponseFlowControlRequiresOffer(t *testing.T) {
+func TestAgentServerDataFlowControlRequiresOffer(t *testing.T) {
 	const (
 		dialID   = int64(7102)
 		target   = "legacy-flow-control-endpoint.invalid:443"
@@ -582,7 +582,7 @@ func TestHTTPConnectResponseFlowControlRequiresOffer(t *testing.T) {
 	waitForConnectionDeletion(t, testClient, dialResponse.GetConnectID())
 }
 
-func TestHTTPConnectResponseFlowControlUsesMonotonicCumulativeLimits(t *testing.T) {
+func TestAgentServerDataFlowControlUsesMonotonicCumulativeLimits(t *testing.T) {
 	const (
 		initialLimit = uint64(8)
 		higherLimit  = uint64(13)
@@ -643,7 +643,7 @@ func TestHTTPConnectResponseFlowControlUsesMonotonicCumulativeLimits(t *testing.
 	}
 }
 
-func TestHTTPConnectResponseFlowControlWindowUpdateWakesOnlyTarget(t *testing.T) {
+func TestAgentServerDataFlowControlWindowUpdateWakesOnlyTarget(t *testing.T) {
 	const (
 		unknownConnectID = int64(7299)
 		legacyConnectID  = int64(7203)
@@ -817,7 +817,7 @@ func (s *secondDataSendBlockingStream) Send(packet *client.Packet) error {
 	return nil
 }
 
-func TestHTTPConnectResponseFlowControlRecordsSuccessfulDataSend(t *testing.T) {
+func TestAgentServerDataFlowControlRecordsSuccessfulDataSend(t *testing.T) {
 	const (
 		connectID       = int64(7301)
 		remainingCredit = 9
@@ -918,7 +918,7 @@ func TestHTTPConnectResponseFlowControlRecordsSuccessfulDataSend(t *testing.T) {
 	}
 }
 
-func TestHTTPConnectResponseFlowControlRejectsInvalidSendProgress(t *testing.T) {
+func TestAgentServerDataFlowControlRejectsInvalidSendProgress(t *testing.T) {
 	for _, test := range []struct {
 		name           string
 		committedTotal uint64
@@ -1034,7 +1034,7 @@ func TestEndpointConnStartCleanupDoesNotWaitForSender(t *testing.T) {
 	}
 }
 
-func TestHTTPConnectResponseFlowControlSendFailureIsTerminal(t *testing.T) {
+func TestAgentServerDataFlowControlSendFailureIsTerminal(t *testing.T) {
 	const (
 		connectID    = int64(7401)
 		maxFrameSize = 1 << 12
