@@ -156,6 +156,7 @@ func TestHTTPConnectResponseBufferLinearizesProducerAndConsumer(t *testing.T) {
 func TestHTTPConnectResponseBufferLinearizesEnqueueWithClose(t *testing.T) {
 	for iteration := 0; iteration < 64; iteration++ {
 		buffer := newHTTPConnectResponseBuffer(1)
+		requireEmptyHTTPConnectResponseBuffer(t, buffer)
 		start := make(chan struct{})
 		enqueued := make(chan bool, 1)
 		var workers sync.WaitGroup
