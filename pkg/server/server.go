@@ -135,6 +135,7 @@ type ProxyClientConnection struct {
 	httpSuppressCloseRequest         bool
 	httpResponseFlowControlStarted   bool
 	httpResponseFlowControlAdmission *httpConnectResponseFlowControlAdmissionState
+	httpResponseFlowControl          *httpConnectResponseFlowControlState
 	closed                           chan struct{}
 
 	closeHTTPOnce    sync.Once

@@ -54,13 +54,13 @@ func TestHTTPConnectDialDoesNotOfferFlowControlWhenDisabled(t *testing.T) {
 	}
 }
 
-func TestHTTPConnectAcceptedResponseFlowControlOwnsAdmissionBeforeEstablishment(t *testing.T) {
+func TestHTTPConnectAcceptedResponseFlowControlEstablishesAtZeroCredit(t *testing.T) {
 	const (
 		connectID  = int64(6201)
 		windowSize = int64(32)
 	)
 
-	fixture := newHTTPConnectFlowControlDialFixture(t, true)
+	fixture := newHTTPConnectFlowControlDialFixtureWithBlockedHTTPWrite(t, true)
 	fixture.proxyServer.SetHTTPConnectFlowControlConfig(windowSize, windowSize, 1, time.Second)
 	allocator := fixture.proxyServer.httpConnectFlowControlAllocator
 	holder := requireHTTPConnectFlowControlReservation(
@@ -101,6 +101,8 @@ func TestHTTPConnectAcceptedResponseFlowControlOwnsAdmissionBeforeEstablishment(
 		select {
 		case <-fixture.pending.connected:
 			t.Fatal("response V1 signaled connected before flow-control admission ownership")
+		case <-fixture.frontendConn.sink.firstWriteStarted:
+			t.Fatal("response V1 started HTTP 200 before flow-control admission ownership")
 		case <-fixture.frontendConn.sink.closeObserved:
 			t.Fatal("response V1 closed the frontend instead of joining flow-control admission")
 		case <-ticker.C:
@@ -139,34 +141,64 @@ func TestHTTPConnectAcceptedResponseFlowControlOwnsAdmissionBeforeEstablishment(
 
 	holder.release()
 	select {
-	case <-state.reservationReady:
-	case <-time.After(writerTestSafetyTimeout):
-		t.Fatal("queued response V1 did not receive released flow-control capacity")
-	}
-	select {
+	case <-fixture.frontendConn.sink.firstWriteStarted:
 	case <-state.done:
-		t.Fatal("assigned response V1 became terminal while the connection remained live")
-	default:
+		t.Fatal("assigned response V1 became terminal before starting HTTP 200")
+	case <-time.After(writerTestSafetyTimeout):
+		t.Fatal("assigned response V1 did not start HTTP 200 after receiving capacity")
 	}
 	assertHTTPConnectFlowControlAllocatorUsage(t, allocator, windowSize, 0)
 	fixture.pending.httpMu.Lock()
-	ownedReservation := state.reservation
+	installedState := fixture.pending.httpResponseFlowControl
+	admissionState := fixture.pending.httpResponseFlowControlAdmission
 	writer = fixture.pending.httpWriter
+	terminal := fixture.pending.httpTerminal
 	fixture.pending.httpMu.Unlock()
-	if ownedReservation == nil {
-		t.Fatal("assigned response V1 did not retain its connection-owned reservation")
+	if admissionState != nil {
+		t.Fatal("assigned response V1 retained admission state after response-state installation")
 	}
-	if writer != nil {
-		t.Fatalf("assigned response V1 attached HTTP writer %p before response-flow setup", writer)
+	if installedState == nil || installedState.reservation == nil {
+		t.Fatal("assigned response V1 did not install connection-owned response state and reservation")
+	}
+	if installedState.done != state.done {
+		t.Fatal("installed response V1 state did not retain admission lifecycle ownership")
+	}
+	if installedState.windowSize != windowSize {
+		t.Fatalf("installed response V1 window size = %d, want %d", installedState.windowSize, windowSize)
+	}
+	if installedState.grantLimit != 0 || installedState.receivedTotal != 0 || installedState.consumedTotal != 0 {
+		t.Fatalf("installed response V1 counters = (%d, %d, %d), want zero credit and progress", installedState.grantLimit, installedState.receivedTotal, installedState.consumedTotal)
+	}
+	if writer == nil {
+		t.Fatal("installed response V1 state did not attach the sole HTTP writer")
+	}
+	if terminal {
+		t.Fatal("installed response V1 state became terminal before HTTP 200 completed")
+	}
+	if got, err := fixture.proxyServer.getFrontend(fixture.agentID, connectID); err != nil || got != fixture.pending {
+		t.Fatalf("published zero-credit connection = %p, %v; want %p", got, err, fixture.pending)
 	}
 	select {
 	case <-fixture.pending.connected:
-		t.Fatal("assigned response V1 signaled connected before response-flow setup")
+		t.Fatal("blocked HTTP 200 signaled connected before the complete response")
 	default:
 	}
 	written, _, _, _ = fixture.frontendConn.sink.snapshot()
 	if len(written) != 0 {
-		t.Fatalf("assigned response V1 wrote HTTP response %q, want none", written)
+		t.Fatalf("blocked HTTP 200 exposed partial frontend bytes %q", written)
+	}
+
+	fixture.frontendConn.sink.release()
+	select {
+	case <-fixture.pending.connected:
+	case <-state.done:
+		t.Fatal("assigned response V1 became terminal before completing HTTP 200")
+	case <-time.After(writerTestSafetyTimeout):
+		t.Fatal("assigned response V1 did not signal connected after complete HTTP 200")
+	}
+	written, _, _, _ = fixture.frontendConn.sink.snapshot()
+	if !bytes.Equal(written, []byte(httpConnectSuccessResponse)) {
+		t.Fatalf("assigned response V1 wrote %q, want complete successful CONNECT response", written)
 	}
 
 	fixture.pending.abortHTTP(fixture.proxyServer, httpConnectAbortFrontendClose)
@@ -176,6 +208,142 @@ func TestHTTPConnectAcceptedResponseFlowControlOwnsAdmissionBeforeEstablishment(
 		t.Fatal("terminal abort did not synchronously release production admission ownership")
 	}
 	assertHTTPConnectFlowControlAllocatorUsage(t, allocator, 0, 0)
+}
+
+func TestHTTPConnectResponseFlowControlRevalidatesAssignedConnection(t *testing.T) {
+	const (
+		agentID    = "response-flow-revalidation-agent"
+		connectID  = int64(6251)
+		windowSize = int64(32)
+	)
+
+	tests := []struct {
+		name   string
+		mutate func(*ProxyClientConnection, context.CancelFunc, *Backend)
+	}{
+		{
+			name: "frontend terminal state",
+			mutate: func(connection *ProxyClientConnection, _ context.CancelFunc, _ *Backend) {
+				connection.httpMu.Lock()
+				connection.httpTerminal = true
+				connection.httpMu.Unlock()
+			},
+		},
+		{
+			name: "backend generation",
+			mutate: func(connection *ProxyClientConnection, _ context.CancelFunc, replacement *Backend) {
+				connection.httpMu.Lock()
+				connection.backend = replacement
+				connection.httpMu.Unlock()
+			},
+		},
+		{
+			name: "backend context",
+			mutate: func(_ *ProxyClientConnection, cancelBackend context.CancelFunc, _ *Backend) {
+				cancelBackend()
+			},
+		},
+		{
+			name: "endpoint connect ID",
+			mutate: func(connection *ProxyClientConnection, _ context.CancelFunc, _ *Backend) {
+				connection.httpMu.Lock()
+				connection.connectID++
+				connection.httpMu.Unlock()
+			},
+		},
+		{
+			name: "endpoint agent ID",
+			mutate: func(connection *ProxyClientConnection, _ context.CancelFunc, _ *Backend) {
+				connection.httpMu.Lock()
+				connection.agentID += "-replacement"
+				connection.httpMu.Unlock()
+			},
+		},
+		{
+			name: "selected mode",
+			mutate: func(connection *ProxyClientConnection, _ context.CancelFunc, _ *Backend) {
+				connection.httpMu.Lock()
+				connection.httpConnectResponseMode = httpConnectResponseModeLegacy
+				connection.httpMu.Unlock()
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			backendContext, cancelBackend := context.WithCancel(context.Background())
+			defer cancelBackend()
+			backend, _ := newWriterTestBackend(backendContext, agentID)
+			replacementBackend, _ := newWriterTestBackend(context.Background(), agentID)
+			server := newWriterTestServer()
+			frontend := newWriterTestImmediateHTTP()
+			connection := &ProxyClientConnection{
+				Mode:                    ModeHTTPConnect,
+				HTTP:                    frontend,
+				CloseHTTP:               frontend.close,
+				closed:                  make(chan struct{}),
+				connected:               make(chan struct{}),
+				backend:                 backend,
+				agentID:                 agentID,
+				connectID:               connectID,
+				httpConnectResponseMode: httpConnectResponseModeAgentToServerByteWindowV1,
+				httpInitialResponse:     []byte(httpConnectSuccessResponse),
+			}
+			allocator := newHTTPConnectFlowControlAllocator(windowSize, windowSize, 0)
+			admission := requireHTTPConnectFlowControlAdmission(t, allocator, httpConnectFlowControlAdmissionGranted)
+			reservationReady, done, started := connection.startHTTPConnectResponseFlowControlAdmission(admission)
+			if !started {
+				t.Fatal("revalidation fixture did not start admission ownership")
+			}
+			select {
+			case <-reservationReady:
+			default:
+				t.Fatal("revalidation fixture did not own its reservation")
+			}
+			t.Cleanup(func() {
+				connection.abortHTTP(server, httpConnectAbortSetupRace)
+				assertHTTPConnectFlowControlAllocatorUsage(t, allocator, 0, 0)
+			})
+
+			expected := httpConnectResponseFlowControlExpectation{
+				backend:   backend,
+				agentID:   agentID,
+				connectID: connectID,
+				mode:      httpConnectResponseModeAgentToServerByteWindowV1,
+			}
+			tt.mutate(connection, cancelBackend, replacementBackend)
+			writer, installed := connection.installHTTPConnectResponseFlowControl(server, expected)
+			if installed {
+				t.Fatalf("%s revalidation installed response state, want rejection", tt.name)
+			}
+			if writer != nil {
+				t.Fatalf("%s revalidation returned writer %p, want nil", tt.name, writer)
+			}
+			select {
+			case <-done:
+			default:
+				t.Fatalf("%s revalidation did not synchronously release admission ownership", tt.name)
+			}
+			assertHTTPConnectFlowControlAllocatorUsage(t, allocator, 0, 0)
+			connection.httpMu.Lock()
+			installedState := connection.httpResponseFlowControl
+			attachedWriter := connection.httpWriter
+			terminal := connection.httpTerminal
+			connection.httpMu.Unlock()
+			if installedState != nil || attachedWriter != nil || !terminal {
+				t.Fatalf("%s revalidation state = (%p, %p, %v), want (nil, nil, true)", tt.name, installedState, attachedWriter, terminal)
+			}
+			select {
+			case <-connection.connected:
+				t.Fatalf("%s revalidation signaled connected", tt.name)
+			default:
+			}
+			written, _, _ := frontend.snapshot()
+			if len(written) != 0 {
+				t.Fatalf("%s revalidation wrote HTTP response %q, want none", tt.name, written)
+			}
+		})
+	}
 }
 
 func TestHTTPConnectEnforcesResponseFlowControlMode(t *testing.T) {
@@ -334,6 +502,18 @@ type httpConnectFlowControlDialFixture struct {
 }
 
 func newHTTPConnectFlowControlDialFixture(t *testing.T, enabled bool) *httpConnectFlowControlDialFixture {
+	return newHTTPConnectFlowControlDialFixtureWithHTTPWrite(t, enabled, true)
+}
+
+func newHTTPConnectFlowControlDialFixtureWithBlockedHTTPWrite(t *testing.T, enabled bool) *httpConnectFlowControlDialFixture {
+	return newHTTPConnectFlowControlDialFixtureWithHTTPWrite(t, enabled, false)
+}
+
+func newHTTPConnectFlowControlDialFixtureWithHTTPWrite(
+	t *testing.T,
+	enabled bool,
+	releaseInitialHTTPWrite bool,
+) *httpConnectFlowControlDialFixture {
 	t.Helper()
 
 	const (
@@ -395,14 +575,20 @@ func newHTTPConnectFlowControlDialFixture(t *testing.T, enabled bool) *httpConne
 		cancelBackend: cancelBackend,
 		target:        target,
 	}
-	return fixture.startDial(t)
+	return fixture.startDialWithHTTPWrite(t, releaseInitialHTTPWrite)
 }
 
 func (f *httpConnectFlowControlDialFixture) startDial(t *testing.T) *httpConnectFlowControlDialFixture {
+	return f.startDialWithHTTPWrite(t, true)
+}
+
+func (f *httpConnectFlowControlDialFixture) startDialWithHTTPWrite(t *testing.T, releaseInitialHTTPWrite bool) *httpConnectFlowControlDialFixture {
 	t.Helper()
 
 	frontendConn := newObservedHTTPConn()
-	frontendConn.sink.release()
+	if releaseInitialHTTPWrite {
+		frontendConn.sink.release()
+	}
 	request := httptest.NewRequest(http.MethodConnect, "http://"+f.target, nil)
 	request.Host = f.target
 	tunnelDone := make(chan struct{})
@@ -412,6 +598,7 @@ func (f *httpConnectFlowControlDialFixture) startDial(t *testing.T) *httpConnect
 	}()
 	t.Cleanup(func() {
 		f.cancelBackend()
+		frontendConn.sink.release()
 		_ = frontendConn.Close()
 		select {
 		case <-tunnelDone:

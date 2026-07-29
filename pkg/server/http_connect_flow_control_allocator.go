@@ -64,6 +64,31 @@ type httpConnectResponseFlowControlAdmissionState struct {
 	done             chan struct{}
 }
 
+type httpConnectResponseFlowControlExpectation struct {
+	backend   *Backend
+	agentID   string
+	connectID int64
+	mode      httpConnectResponseMode
+}
+
+type httpConnectResponseFlowControlState struct {
+	reservation   *httpConnectFlowControlReservation
+	done          chan struct{}
+	windowSize    int64
+	grantLimit    uint64
+	receivedTotal uint64
+	consumedTotal uint64
+}
+
+// installHTTPConnectResponseFlowControl is an inert seam for the executable
+// contract that precedes the zero-credit establishment implementation.
+func (c *ProxyClientConnection) installHTTPConnectResponseFlowControl(
+	server *ProxyServer,
+	expected httpConnectResponseFlowControlExpectation,
+) (*httpConnectWriter, bool) {
+	return nil, true
+}
+
 func newHTTPConnectFlowControlAllocator(windowSize, poolSize int64, maxPendingAdmissions int) *httpConnectFlowControlAllocator {
 	return &httpConnectFlowControlAllocator{
 		windowSize:           windowSize,
