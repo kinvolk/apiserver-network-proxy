@@ -74,6 +74,7 @@ type httpConnectResponseFlowControlExpectation struct {
 
 type httpConnectResponseFlowControlState struct {
 	reservation   *httpConnectFlowControlReservation
+	buffer        *httpConnectResponseBuffer
 	done          chan struct{}
 	windowSize    int64
 	grantLimit    uint64

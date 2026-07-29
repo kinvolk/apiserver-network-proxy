@@ -167,6 +167,17 @@ func TestHTTPConnectAcceptedResponseFlowControlEstablishesAtZeroCredit(t *testin
 	if installedState.windowSize != windowSize {
 		t.Fatalf("installed response V1 window size = %d, want %d", installedState.windowSize, windowSize)
 	}
+	responseBuffer := installedState.buffer
+	if responseBuffer == nil {
+		t.Fatal("installed response V1 state did not own its reservation-backed byte buffer")
+	}
+	if got := responseBuffer.capacity(); got != windowSize {
+		t.Fatalf("installed response V1 buffer capacity = %d, want window %d", got, windowSize)
+	}
+	data, dataReady, open := responseBuffer.peek()
+	if len(data) != 0 || dataReady == nil || !open {
+		t.Fatalf("installed zero-credit response buffer = (%q, %p, %v), want (empty, non-nil wait, true)", data, dataReady, open)
+	}
 	if installedState.grantLimit != 0 || installedState.receivedTotal != 0 || installedState.consumedTotal != 0 {
 		t.Fatalf("installed response V1 counters = (%d, %d, %d), want zero credit and progress", installedState.grantLimit, installedState.receivedTotal, installedState.consumedTotal)
 	}
@@ -207,6 +218,9 @@ func TestHTTPConnectAcceptedResponseFlowControlEstablishesAtZeroCredit(t *testin
 	case <-state.done:
 	default:
 		t.Fatal("terminal abort did not synchronously release production admission ownership")
+	}
+	if data, dataReady, open := responseBuffer.peek(); len(data) != 0 || dataReady != nil || open {
+		t.Fatalf("terminal response buffer after done = (%q, %p, %v), want (empty, nil, false)", data, dataReady, open)
 	}
 	assertHTTPConnectFlowControlAllocatorUsage(t, allocator, 0, 0)
 }
