@@ -52,6 +52,31 @@ type Tunnel struct {
 	Server *ProxyServer
 }
 
+func (t *Tunnel) cleanupEstablishedConnection(host string, connection *ProxyClientConnection) {
+	// Stop routing packets to the frontend before any operation that can block.
+	if removed := t.Server.removeEstablished(connection.agentID, connection.connectID); removed != nil {
+		klog.V(3).InfoS("Removed established connection on tunnel close", "host", host, "agentID", connection.agentID, "connectionID", connection.connectID)
+	}
+
+	// Close the frontend before notifying the backend. Backend.Send can block on
+	// the agent stream, but local connection cleanup must not depend on it.
+	if err := connection.CloseHTTP(); err != nil {
+		klog.V(2).InfoS("failed to close HTTP frontend connection", "host", host, "agentID", connection.agentID, "connectionID", connection.connectID, "error", err)
+	}
+
+	packet := &client.Packet{
+		Type: client.PacketType_CLOSE_REQ,
+		Payload: &client.Packet_CloseRequest{
+			CloseRequest: &client.CloseRequest{
+				ConnectID: connection.connectID,
+			},
+		},
+	}
+	if err := connection.backend.Send(packet); err != nil {
+		klog.V(2).InfoS("failed to send close request packet", "host", host, "agentID", connection.agentID, "connectionID", connection.connectID)
+	}
+}
+
 func (t *Tunnel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	metrics.Metrics.HTTPConnectionInc()
 	defer metrics.Metrics.HTTPConnectionDec()
@@ -164,6 +189,10 @@ func (t *Tunnel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// The connection is successful. Mark it as established so the deferred
 		// cleanup function knows not to remove it from PendingDial.
 		established = true
+		// addEstablished happens before connected is closed. Register cleanup
+		// before writing the HTTP response so a failed handshake cannot leave the
+		// established connection tracked.
+		defer t.cleanupEstablishedConnection(r.Host, connection)
 
 		// Now that connection is established, send 200 OK to switch to tunnel mode
 		_, err = conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
@@ -198,29 +227,6 @@ func (t *Tunnel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// The deferred cleanup will run when we return here.
 		return
 	}
-
-	defer func() {
-		packet := &client.Packet{
-			Type: client.PacketType_CLOSE_REQ,
-			Payload: &client.Packet_CloseRequest{
-				CloseRequest: &client.CloseRequest{
-					ConnectID: connection.connectID,
-				},
-			},
-		}
-
-		if err = backend.Send(packet); err != nil {
-			klog.V(2).InfoS("failed to send close request packet", "host", r.Host, "agentID", connection.agentID, "connectionID", connection.connectID)
-		}
-
-		// Remove from established connections immediately.
-		// We don't wait for CLOSE_RSP since the HTTP tunnel is already closing.
-		// This prevents memory leaks when agents are slow to respond or CLOSE_RSP is lost.
-		if removed := t.Server.removeEstablished(connection.agentID, connection.connectID); removed != nil {
-			klog.V(3).InfoS("Removed established connection on tunnel close", "host", r.Host, "agentID", connection.agentID, "connectionID", connection.connectID)
-		}
-		// The top-level defer handles conn.Close()
-	}()
 
 	connID := connection.connectID
 	agentID := connection.agentID
